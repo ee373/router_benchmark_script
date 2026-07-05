@@ -1,0 +1,745 @@
+# Router benchmark tests
+
+This directory contains the individual benchmark implementations used by `test_basic_speed.py`.
+
+The launcher is the normal entry point:
+
+```bash
+sudo python3 test_basic_speed.py --target i226_1g --duration 60
+```
+
+Individual tests can also be executed directly when debugging a specific subsystem.
+
+## File map
+
+| File | Role |
+|---|---|
+| `target_profiles.py` | Shared hardware, PCI, driver, port, and IPv4 profile definitions. |
+| `run_router_bench_v4_stl_throughput_pps.py` | TRex STL IPv4 NAT throughput and PPS benchmark. |
+| `run_router_bench_v4_tcp_scratch_max_sessions.py` | TCP scratch maximum concurrent session benchmark without TRex. Included in the default set and `--run-all`. |
+| `run_router_bench_v4_astf_max_sessions.py` | Legacy TRex ASTF maximum concurrent session benchmark. Launcher execution requires `--run-astf-max-sessions`. |
+| `run_router_bench_v4_astf_sessions_cps.py` | Legacy TRex ASTF short-session CPS benchmark. Launcher execution requires `--run-astf-sessions-cps`. |
+| `run_router_bench_v4_astf_nat_stability.py` | TRex ASTF TCP/UDP NAT stability soak benchmark. |
+| `run_router_bench_v4_iperf3_latency.py` | Linux namespace based TCP/UDP L4 request-response latency benchmark with optional iperf3 load. |
+| `run_router_bench_v4_dns_latency.py` | DNS rate/cache/table benchmark with built-in dummy WAN-side DNS server. |
+| `run_router_bench_v4_dhcp_scratch.py` | DHCPv4 basic DORA latency, burst, and same-MAC reconnect benchmark using a scratch raw-socket client. |
+
+## Launcher order
+
+The launcher executes tests in this order:
+
+```text
+01_stl_throughput_pps
+02_astf_max_sessions
+02_astf_sessions_cps
+03_astf_nat_stability
+04_iperf3_l4rr_latency
+05_dns_forwarder_cache_latency
+06_dhcp_scratch_lease_acquisition
+```
+
+No-option launcher execution runs every default test except ASTF NAT stability. TCP scratch max sessions and DHCP scratch are included in the no-option default set.
+
+## Shared target profiles
+
+`target_profiles.py` is the single source of target information. The main profile fields are:
+
+| Field | Meaning |
+|---|---|
+| `interfaces` | PCI BDF list used by TRex/DPDK. |
+| `kernel_drivers` | Kernel drivers used by namespace based tests. |
+| `dpdk_drivers` | DPDK drivers used by TRex STL/ASTF tests. `auto` enables driver auto-selection. |
+| `lan_iface`, `wan_iface` | Linux netdev names used by L4/DNS namespace tests. |
+| `lan_port`, `wan_port` | TRex port numbers. |
+| `lan_ip`, `lan_gw`, `wan_ip`, `wan_gw`, `router_wan_ip` | Addressing used by namespace tests and metadata. |
+| `line_rate_gbps` | Line rate used by load percentage calculations. |
+| `trex_cores` | Default TRex core count. |
+
+Direct L2 loop baseline profiles are also defined for L4 latency baseline measurement:
+
+```text
+i226_1g_loop
+i226_2p5g_loop
+x540_10g_loop
+```
+
+Those profiles declare `supported_tests = ["l4_latency"]` and are rejected by the launcher for TRex router/NAT tests.
+
+## 01: STL throughput/PPS
+
+Script:
+
+```text
+run_router_bench_v4_stl_throughput_pps.py
+```
+
+Purpose:
+
+- Generates IPv4 NAT traffic with TRex STL.
+- Measures throughput and PPS for 64-byte and large-frame traffic.
+- Performs Mbps-based rate search by default.
+- Writes NDR/PDR summary rows.
+
+Main outputs:
+
+```text
+summary_all.csv
+stl_raw.csv
+metadata.json
+trex_cfg.yaml
+trex_interface_prepare.csv
+trex_server_stl.log
+```
+
+Useful direct execution:
+
+```bash
+sudo python3 tests/run_router_bench_v4_stl_throughput_pps.py \
+  --target i226_1g \
+  --duration 60 \
+  --repeat 1
+```
+
+Performance notes:
+
+```text
+The WAN DNS server and LAN DNS client run as separate processes in separate network namespaces.
+The WAN DNS server runs packet response and WAN-query counter publishing separately.
+By default, WAN-side query logs are not suppressed. Rows are accumulated in memory during the full DNS benchmark and written to dns_server_queries.csv when the WAN DNS server exits. The sidecar dns_server_queries.csv.stats.json still counts all WAN-side queries and is used for wan_queries_delta during measurement.
+By default, LAN-side measurement keeps only raw send/receive timestamps and minimal DNS status fields during each measurement step. Success rate, failure rate, timeout classification, latency percentiles, and per-query CSV rows are calculated after the timed interval ends. This avoids both per-packet disk I/O and per-packet aggregation work during the timed interval.
+Use --dns-sample-limit 0 or --dns-server-query-log-limit 0 only when intentionally disabling detailed logs. Full WAN query logging can consume significant memory at high QPS and long duration.
+
+Delayed table pass: the second `cache_table_size` pass waits `--dns-table-reuse-interval-sec` seconds, 600 seconds by default. It is skipped unless `--dns-run-delayed-table` is specified. The launcher supplies this flag for `--run-all` and `--run-dns-all`; plain `--run-dns-latency` omits it.
+```
+
+Note: the default DNS answer mode returns deterministic random public-looking IPv4 addresses. Some routers apply DNS rebinding protection and suppress answers that contain private or special-use addresses such as `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or `100.64.0.0/10`. If WAN-side query logs increase but LAN-side success remains 0%, check this setting first.
+
+Useful options:
+
+```text
+--duration
+--repeat
+--rate-search / --no-rate-search
+--rate-mbps-steps
+--refine-step
+--single-load-percent
+--lossless-threshold
+--stop-on-first-loss
+--no-auto-dpdk-bind
+--dpdk-driver
+--interfaces
+--lan-ip / --lan-gw / --wan-ip / --wan-gw / --router-wan-ip
+--line-rate-gbps
+--cores
+```
+
+
+## 02: TCP scratch maximum sessions
+
+Script: `run_router_bench_v4_tcp_scratch_max_sessions.py`
+
+Purpose:
+
+- Measures NAT/TCP session capacity without TRex.
+- Starts a Python TCP server in the WAN namespace.
+- Creates LAN-side TCP sessions with source ports from `65535` down to `1024`.
+- Uses `100 CPS` by default. The rate is controlled by `--session-cps`; `--session-ramp-cps` is also accepted as an alias for compatibility with the legacy ASTF max-session option name.
+- Sends one framed JSON payload per active session every second. The payload contains `source_port`, `elapsed_sec`, and `direction=UP`; the WAN server replies with `direction=DOWN`. If the DOWN reply for a keepalive is not received within `--keepalive-timeout-sec` seconds, the session is marked disconnected. The default timeout is `1.0` second.
+- After all source ports have been attempted, keeps the sessions active for `600` seconds by default.
+- Prints one persistent progress line every `10` seconds by default. This interval is controlled by `--progress-interval-sec`.
+
+Result files:
+
+- `tcp_scratch_max_sessions_timeseries.csv`
+- `tcp_scratch_max_sessions_sessions.csv`
+- `tcp_scratch_server_timeseries.csv`
+  - Includes `target_session_attempts_total` and `target_session_attempts_delta`, copied from the LAN-side session creation status so WAN accept counts can be compared with attempted connection counts.
+- `tcp_scratch_max_sessions_summary.json`
+- `tcp_scratch_server_summary.json`
+- `summary.csv`
+- `summary.json`
+
+Important counters:
+
+- `session_create_success_total`
+- `session_create_fail_total`
+- `session_mid_disconnect_total`
+- `keepalive_timeout_total`
+- `current_active_sessions`
+- `*_delta` fields
+- `payload_message_loss_rate`
+- `target_session_attempts_total` / `target_session_attempts_delta` in `tcp_scratch_server_timeseries.csv`
+
+Launcher:
+
+```bash
+sudo python3 test_basic_speed.py --target i226_1g --run-tcp-scratch-max-sessions --session-ramp-cps 33
+```
+
+This test is part of the no-option default set and `--run-all`.
+
+Useful options:
+
+```text
+--session-cps
+--session-ramp-cps
+--source-start-port / --source-end-port
+--post-create-hold-sec
+--keepalive-interval-sec
+--keepalive-timeout-sec
+--progress-interval-sec
+```
+
+## 02: legacy ASTF maximum sessions
+
+Script:
+
+```text
+run_router_bench_v4_astf_max_sessions.py
+```
+
+Purpose:
+
+- Uses TRex ASTF to test NAT session scale.
+- Runs the maximum concurrent session test.
+- Records 1-second time-series data for the maximum-session phase.
+
+Main outputs:
+
+```text
+summary_all.csv
+astf_raw.csv
+astf_max_sessions_timeseries.csv
+metadata.json
+trex_server_astf.log
+```
+
+Useful direct execution:
+
+```bash
+sudo python3 tests/run_router_bench_v4_astf_max_sessions.py \
+  --target i226_1g \
+  --max-sessions 65535 \
+  --session-ramp-cps 100 \
+  --repeat 1
+```
+
+Useful options:
+
+```text
+--max-sessions
+--session-ramp-cps
+--session-hold-sec
+--astf-tcp-port
+--show-progress / --no-progress
+--progress-interval
+--progress-percent-step
+--no-auto-dpdk-bind
+--dpdk-driver
+--interfaces
+--lan-ip / --lan-gw / --wan-ip / --wan-gw / --router-wan-ip
+--line-rate-gbps
+--cores
+```
+
+## 02: legacy ASTF short-session CPS
+
+Script:
+
+```text
+run_router_bench_v4_astf_sessions_cps.py
+```
+
+Purpose:
+
+- Uses TRex ASTF to test short-session NAT creation rate.
+- Runs a short-session CPS search.
+
+Main outputs:
+
+```text
+summary_all.csv
+astf_raw.csv
+metadata.json
+trex_server_astf.log
+```
+
+Useful direct execution:
+
+```bash
+sudo python3 tests/run_router_bench_v4_astf_sessions_cps.py \
+  --target i226_1g \
+  --duration 60 \
+  --repeat 1
+```
+
+Useful options:
+
+```text
+--max-cps
+--cps-steps
+--representative-cps
+--loss-stop-threshold
+--session-success-stop-threshold
+--stable-success-threshold
+--stable-loss-threshold
+--cps-teardown-timeout
+--astf-tcp-port
+--no-auto-dpdk-bind
+--dpdk-driver
+--interfaces
+--lan-ip / --lan-gw / --wan-ip / --wan-gw / --router-wan-ip
+--line-rate-gbps
+--cores
+```
+
+## 03: ASTF NAT stability soak
+
+Script:
+
+```text
+run_router_bench_v4_astf_nat_stability.py
+```
+
+Purpose:
+
+- Uses TRex ASTF to run repeated NAT stability cycles.
+- Default pattern runs TCP and UDP cycles.
+- Each cycle creates 200 flows at 50 CPS by default.
+- Each flow transfers 1 MB by default, then the flow is explicitly completed or closed.
+- The next cycle begins after the configured inter-cycle sleep.
+
+Main outputs:
+
+```text
+summary_all.csv
+summary_tcp.csv
+summary_udp.csv
+astf_nat_stability_tcp_cycles.csv
+astf_nat_stability_tcp_raw.csv
+astf_nat_stability_udp_cycles.csv
+astf_nat_stability_udp_raw.csv
+metadata.json
+trex_server_astf.log
+```
+
+Useful direct execution:
+
+```bash
+sudo python3 tests/run_router_bench_v4_astf_nat_stability.py \
+  --target i226_1g \
+  --soak-duration-sec 3600
+```
+
+
+Note: the default DNS answer mode returns deterministic random public-looking IPv4 addresses. Some routers apply DNS rebinding protection and suppress answers that contain private or special-use addresses such as `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or `100.64.0.0/10`. If WAN-side query logs increase but LAN-side success remains 0%, check this setting first.
+
+Useful options:
+
+```text
+--soak-duration-sec
+--protocols
+--cycle-cps
+--cycle-sessions
+--mb-per-session
+--payload-bytes-per-session
+--payload-direction
+--inter-cycle-sleep-sec
+--cycle-hard-timeout-sec
+--connect-timeout-sec
+--teardown-timeout-sec
+--generation-grace-sec
+--completion-quiet-sec
+--active-flow-complete-threshold
+--sample-interval-sec
+--stable-success-threshold
+--stable-loss-threshold
+--payload-completion-threshold
+--payload-chunk-bytes
+--udp-msg-payload-bytes
+--udp-mtu
+--tcp-mss
+--tcp-window-kb
+--astf-tcp-port
+--astf-udp-port
+--client-port-min
+--client-port-max
+--no-auto-dpdk-bind
+--dpdk-driver
+--interfaces
+--lan-ip / --lan-gw / --wan-ip / --wan-gw / --router-wan-ip
+--line-rate-gbps
+--cores
+```
+
+## 04: iperf3 L4 request-response latency
+
+Script:
+
+```text
+run_router_bench_v4_iperf3_latency.py
+```
+
+Purpose:
+
+- Measures application-layer TCP or UDP request-response RTT.
+- Can measure idle RTT and RTT under iperf3 load.
+- Default load phases are 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, and 99 percent of the target line rate.
+- Uses Linux network namespaces so traffic must traverse the DUT.
+- Rebinds NICs from DPDK back to kernel drivers when required.
+
+Topology:
+
+```text
+LAN namespace -> DUT/router -> WAN namespace
+```
+
+Main outputs:
+
+```text
+summary_all.csv
+latency_idle_samples.csv
+latency_load_10pct_samples.csv ... latency_load_99pct_samples.csv
+l4rr_client_idle.json
+l4rr_client_load_10pct.json ... l4rr_client_load_99pct.json
+iperf3_client_load_10pct.json ... iperf3_client_load_99pct.json
+metadata.json
+namespace_setup.csv
+```
+
+Useful direct execution:
+
+```bash
+sudo python3 tests/run_router_bench_v4_iperf3_latency.py \
+  --target i226_1g \
+  --duration 30 \
+  --l4-transport udp \
+  --load-direction download
+```
+
+
+Note: the default DNS answer mode returns deterministic random public-looking IPv4 addresses. Some routers apply DNS rebinding protection and suppress answers that contain private or special-use addresses such as `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or `100.64.0.0/10`. If WAN-side query logs increase but LAN-side success remains 0%, check this setting first.
+
+Useful options:
+
+```text
+--duration
+--latency-duration-sec
+--latency-interval-sec
+--latency-payload-size-bytes
+--latency-timeout-sec
+--latency-protocol
+--load-protocol
+--l4-transport
+--load-percentages
+--load-direction
+--no-l4rr-preflight
+--setup-namespaces / --no-setup-namespaces
+--replace-namespaces / --no-replace-namespaces
+--keep-namespaces
+--auto-kernel-bind / --no-auto-kernel-bind
+--restore-dpdk-after / --no-restore-dpdk-after
+--lan-iface / --wan-iface
+--lan-ns / --wan-ns
+--post-namespace-settle-sec
+--interface-ready-timeout-sec
+--dpdk-driver
+```
+
+## 05: DNS rate/cache/table benchmark
+
+Script:
+
+```text
+run_router_bench_v4_dns_latency.py
+```
+
+Purpose:
+
+- Starts a built-in dummy UDP DNS server in the WAN namespace.
+- Sends DNS A queries from the LAN namespace to the DUT DNS forwarder.
+- Measures non-cache DNS forwarding performance at E6 QPS steps from 10 to 10000.
+- Measures cache-hit DNS response performance at cache E6 QPS steps from 10 to 48000.
+- Measures approximate DNS cache table size by checking whether re-queries reach the WAN DNS server.
+
+Topology:
+
+```text
+LAN namespace DNS client -> DUT DNS forwarder/cache -> WAN namespace dummy DNS server
+```
+
+Router/DUT preparation:
+
+- Configure the DUT WAN DNS server to the benchmark host WAN IP.
+- For the built-in `i226_1g` and `i226_2p5g` profiles, this is normally `192.168.100.1`.
+
+Default generated names use the suffix:
+
+```text
+routerbench.example.net
+```
+
+Example generated name:
+
+```text
+r000000001.routerbench.example.net
+```
+
+Default DNS subtests:
+
+```text
+nocache_rate:
+  E6 QPS steps: 10,15,22,33,47,68,100,150,220,330,470,680,1000,1500,2200,3300,4700,6800,10000
+  Unique qnames are queried for each request.
+  Each QPS step uses --duration seconds.
+  The subtest stops when failure_rate_pct >= 50 or rtt_max_ms >= 1000.
+
+cache_rate:
+  First, 100 qnames are preloaded into the DUT DNS cache.
+  The same 100 qnames are then queried in round-robin order at cache E6 QPS steps from 10 to 48000.
+  Each QPS step uses --duration seconds.
+  The subtest stops when failure_rate_pct >= 50 or rtt_max_ms >= 1000.
+
+cache_table_reuse_size:
+  E6 table-size steps from 10 to 10000.
+  The qname pool starts with the 100 qnames preloaded by cache_rate.
+  Each larger step adds only the missing qnames, then re-queries the whole accumulated pool at 100 QPS.
+  WAN-side DNS queries during verify are treated as cache overflow or cache bypass.
+  The subtest stops when failure_rate_pct >= 50 or wan_queries_delta / cache_table_size >= 50%.
+
+cache_table_size:
+  Runs after a 600 second interval by default.
+  It also uses an accumulated qname pool instead of replacing the table at each step. Because this pass runs after the long idle interval, each table-size step first preloads the exact qname set for that step, then immediately verifies the same set at 100 QPS.
+  This checks routers that keep old cache entries until timeout instead of evicting immediately.
+  The subtest stops when failure_rate_pct >= 50 or wan_queries_delta / cache_table_size >= 50%.
+```
+
+Main outputs:
+
+```text
+summary_all.csv
+dns_server_queries.csv
+dns_server_queries.csv.stats.json
+dns_<phase>_<stage>_<step>_samples.csv
+dns_<phase>_<stage>_<step>.json
+metadata.json
+namespace_setup.csv
+dns_server.stdout.log
+dns_server.stderr.log
+```
+
+Important summary columns:
+
+```text
+phase
+stage
+step_value
+target_qps
+actual_qps
+success_rate_pct
+failure_rate_pct
+fill_rate_pct
+rtt_p50_ms
+rtt_p95_ms
+rtt_p99_ms
+rtt_max_ms
+wan_queries_delta
+cache_table_size
+cache_overflow_detected
+cache_overflow_rate_pct
+stop_reason
+```
+
+Useful direct execution:
+
+```bash
+sudo python3 tests/run_router_bench_v4_dns_latency.py \
+  --target i226_1g \
+  --duration 60
+```
+
+Launcher execution for DNS only:
+
+```bash
+sudo python3 test_basic_speed.py \
+  --target i226_1g \
+  --run-dns-latency \
+  --duration 60
+```
+
+Short smoke test:
+
+```bash
+sudo python3 test_basic_speed.py \
+  --target i226_1g \
+  --run-dns-latency \
+  --duration 3 \
+  --dns-e6-steps 10,100 \
+  --dns-skip-table
+```
+
+
+Note: the default DNS answer mode returns deterministic random public-looking IPv4 addresses. Some routers apply DNS rebinding protection and suppress answers that contain private or special-use addresses such as `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or `100.64.0.0/10`. If WAN-side query logs increase but LAN-side success remains 0%, check this setting first.
+
+Useful options:
+
+```text
+--duration
+--dns-port
+--dns-domain-suffix
+--dns-answer-mode     default: random
+--dns-answer-base-ip  default: 93.184.0.1, used only with --dns-answer-mode fixed
+--dns-ttl-sec
+--dns-timeout-sec
+--dns-sample-limit        default: -1, log all per-step LAN samples after post aggregation
+--dns-server-query-log-limit  default: -1, keep all WAN queries in memory and write them when the DNS server exits
+--dns-socket-buffer-bytes
+--dns-server-log-batch-size  retained for compatibility; WAN query CSV is written at server shutdown
+--dns-server-log-flush-sec   stats sidecar update interval; WAN query CSV is written at server shutdown
+--dns-server-start-delay-sec
+--dns-client-server-ip
+--dns-e6-steps
+--dns-cache-e6-steps
+--dns-record-count
+`--dns-record-count 0` uses automatic sizing. Automatic sizing now reserves separate qname ranges for nocache, cache preload, and table-size phases. If a fixed record count is specified, it must cover the sum of all selected nocache E6 steps for the selected `--duration`, the cache preload count, and the largest table-size step.
+
+--dns-cache-preload-count
+--dns-table-qps
+--dns-table-overflow-rate-pct
+--dns-table-reuse-interval-sec
+--dns-run-delayed-table
+--dns-skip-table-reuse
+--dns-stop-failure-rate-pct
+--dns-stop-response-ms
+--dns-randomize
+--dns-skip-nocache
+--dns-skip-cache
+--dns-skip-table
+--setup-namespaces / --no-setup-namespaces
+--replace-namespaces / --no-replace-namespaces
+--keep-namespaces
+--auto-kernel-bind / --no-auto-kernel-bind
+--restore-dpdk-after / --no-restore-dpdk-after
+--lan-iface / --wan-iface
+--lan-ns / --wan-ns
+--lan-prefix / --wan-prefix
+--lan-ip / --lan-gw / --wan-ip / --wan-gw / --router-wan-ip
+```
+
+## 06: DHCPv4 basic latency using scratch raw socket
+
+Script:
+
+```text
+run_router_bench_v4_dhcp_scratch.py
+```
+
+Purpose:
+
+- Does not use TRex EMU.
+- Uses a small Python AF_PACKET raw-socket DHCPv4 client.
+- Sends DHCP DISCOVER/REQUEST/RELEASE directly as Ethernet frames from the DUT LAN-side NIC.
+- Checks basic DHCP DORA success and latency.
+- Runs a small burst test.
+- Runs a same-MAC reconnect test.
+
+Default behavior:
+
+```text
+single_client_latency: 1 client x 3 trials
+burst_clients_latency: 10 clients x 1 trial
+reconnect: same MAC initial lease -> DHCP RELEASE -> 60 sec wait -> same MAC reconnect x 1 trial
+```
+
+Each normal trial uses a different MAC address range to reduce interference from previously created DUT leases. The reconnect test intentionally reuses the same MAC before and after the 60-second wait.
+
+Main outputs:
+
+```text
+summary_all.csv
+dhcp_scratch_trials.csv
+dhcp_scratch_reconnect.csv
+dhcp_scratch_clients.csv
+dhcp_scratch_events.csv
+dhcp_emu_trials.csv          # compatibility alias
+dhcp_emu_reconnect.csv       # compatibility alias
+dhcp_emu_clients.csv         # compatibility alias
+dhcp_emu_events.csv          # compatibility alias
+namespace_setup.csv
+metadata.json
+```
+
+Useful launcher execution:
+
+```bash
+sudo python3 test_basic_speed.py \
+  --target i226_1g \
+  --run-dhcp-scratch
+```
+
+The historical selector also works and starts the same scratch implementation:
+
+```bash
+sudo python3 test_basic_speed.py \
+  --target i226_1g \
+  --run-dhcp-scratch
+```
+
+Useful direct execution:
+
+```bash
+sudo python3 tests/run_router_bench_v4_dhcp_scratch.py \
+  --target i226_1g \
+  --out-dir /var/trex/dhcp_scratch_test
+```
+
+Useful options:
+
+```text
+--dhcp-single-repeats
+--dhcp-burst-clients
+--dhcp-burst-repeats
+--dhcp-reconnect-repeats
+--dhcp-reconnect-wait-sec
+--dhcp-timeout-sec
+--dhcp-poll-interval-sec
+--dhcp-between-trials-sec
+--dhcp-client-mac-base
+--dhcp-vlan
+--dhcp-qinq
+--dhcp-hostname-prefix
+--dhcp-release-at-end / --no-dhcp-release-at-end
+--dhcp-ns
+--lan-iface
+--no-auto-kernel-bind
+--restore-dpdk-after / --no-restore-dpdk-after
+--dpdk-driver
+--interfaces
+--lan-ip / --lan-gw / --wan-ip / --wan-gw / --router-wan-ip
+--line-rate-gbps
+--cores
+```
+
+Notes:
+
+- The DUT LAN-side DHCP server must be enabled.
+- The DUT DHCP pool must contain enough free leases for all trial MAC addresses.
+- The reported latency is discover-to-ACK time when ACK is observed.
+- The reconnect test sends DHCP RELEASE, waits 60 seconds by default, and then performs DORA again with the same MAC address.
+- The LAN NIC is moved into a dedicated namespace during the test and restored afterwards.
+
+
+## NIC driver state handling
+
+TRex based tests and namespace based tests require different NIC states:
+
+| Test group | Driver state |
+|---|---|
+| STL / ASTF | NICs bound to DPDK driver. |
+| L4 latency / DNS | NICs bound to kernel driver and moved into Linux namespaces. |
+
+The scripts perform the needed transition automatically when profiles define both `kernel_drivers` and `dpdk_drivers`.
+
+`trex_interface_prepare.csv` records namespace deletion and PCI driver binding actions for TRex-based tests.
+
+`namespace_setup.csv` records namespace creation, interface movement, and IP configuration for L4/DNS tests.
