@@ -8,11 +8,11 @@ Topology:
   - WAN namespace: dummy authoritative-like DNS server listens on the test host WAN IP.
   - The DUT/router must be configured to use the WAN-side test-host IP as its DNS server.
 
-Measurements:
-  1. nocache_rate: unique A queries at E6 QPS steps from 10 to 10000.
-  2. cache_rate: preload 100 names, then round-robin those 100 names at E6 QPS steps.
-  3. cache_table_size: preload N unique names at 100 QPS, then re-query the same N names at 100 QPS
-     and detect cache overflow from WAN DNS server re-queries.
+Measurements (execution order):
+  1. cache_table_reuse_size/cache_table_size: preload N unique names at 100 QPS, then
+     re-query the same N names and detect cache overflow from benchmark-name WAN re-queries.
+  2. nocache_rate: unique A queries at E6 QPS steps from 10 to 10000.
+  3. cache_rate: preload 100 names, then round-robin those 100 names at E6 QPS steps.
 """
 
 import argparse
@@ -345,7 +345,8 @@ def run_internal_dns_server(argv):
 
     stop_event = threading.Event()
     stats_file = Path(args.stats_file) if args.stats_file else Path(str(args.query_log) + ".stats.json")
-    total_received = [0]
+    total_received_all = [0]
+    total_received_benchmark = [0]
     # Keep WAN-side query logs in memory during measurement.  Disk writes are intentionally
     # delayed until the DNS server process is terminated at the end of the DNS benchmark.
     # This keeps server-side CSV I/O out of the timed load phases while preserving full logs.
@@ -363,7 +364,21 @@ def run_internal_dns_server(argv):
     def write_stats():
         try:
             tmp = stats_file.with_suffix(stats_file.suffix + ".tmp")
-            tmp.write_text(json.dumps({"total_queries": int(total_received[0]), "unix_ts": time.time()}), encoding="utf-8")
+            all_queries = int(total_received_all[0])
+            benchmark_queries = int(total_received_benchmark[0])
+            tmp.write_text(
+                json.dumps({
+                    # total_queries remains the benchmark-only counter for compatibility
+                    # with existing readers.  all_queries exposes unrelated/background
+                    # DNS traffic for diagnostics without contaminating table-size results.
+                    "total_queries": benchmark_queries,
+                    "benchmark_queries": benchmark_queries,
+                    "all_queries": all_queries,
+                    "ignored_queries": max(0, all_queries - benchmark_queries),
+                    "unix_ts": time.time(),
+                }),
+                encoding="utf-8",
+            )
             tmp.replace(stats_file)
         except Exception:
             pass
@@ -416,8 +431,17 @@ def run_internal_dns_server(argv):
                     status = "error"
             except Exception as exc:
                 status = f"error:{exc}"
-            total_received[0] += 1
-            if int(args.query_log_limit) < 0 or total_received[0] <= int(args.query_log_limit) or status != "answered":
+            total_received_all[0] += 1
+            # Only generated router-benchmark names participate in WAN miss and
+            # cache-overflow calculations.  Routers may send their own NTP/vendor/
+            # connectivity-check DNS traffic to the configured upstream server;
+            # counting that traffic caused small table steps to terminate falsely.
+            if answer_ip_for_qname(
+                qname, args.domain_suffix, args.answer_base_ip, args.max_records,
+                args.answer_mode, args.answer_random_seed,
+            ):
+                total_received_benchmark[0] += 1
+            if int(args.query_log_limit) < 0 or total_received_all[0] <= int(args.query_log_limit) or status != "answered":
                 query_rows.append([received, addr[0], addr[1], qname, qtype, status])
     finally:
         stop_event.set()
@@ -944,7 +968,7 @@ def count_server_queries(path):
     if stats_path.exists():
         try:
             data = json.loads(stats_path.read_text(encoding="utf-8"))
-            return int(data.get("total_queries") or 0)
+            return int(data.get("benchmark_queries", data.get("total_queries", 0)) or 0)
         except Exception:
             pass
     if not path.exists():
@@ -1230,8 +1254,10 @@ def write_metadata(out_dir, args, target, steps, cache_steps, max_records):
             "nocache_rate uses unique qnames for each request.",
             "cache_rate preloads 100 qnames, then round-robins those qnames at each target QPS.",
             "cache_rate records WAN re-query count divided by the preload qname count as cache_overflow_rate_pct. It does not stop on WAN re-query rate.",
-            "cache_table_reuse_size grows a cumulative cached qname pool, starting with cache_rate preload qnames, then verifies the whole pool at 100 QPS.",
-            "cache_table_size is the delayed table pass. It runs only when --dns-run-delayed-table is set, normally injected by launcher --run-all or --run-dns-all.",
+            "Table-size tests run before nocache_rate and cache_rate so high-QPS traffic cannot contaminate cache-capacity measurements.",
+            "cache_table_reuse_size grows an independent cumulative qname pool and verifies the whole pool at 100 QPS.",
+            "cache_table_size is the optional delayed table pass using a second independent qname range. It runs only when --dns-run-delayed-table is set, normally injected by launcher --run-all or --run-dns-all.",
+            "WAN counters used for cache decisions include only generated benchmark qnames; unrelated router background DNS traffic remains in dns_server_queries.csv but is excluded from wan_queries_delta.",
             "WAN re-query count divided by verified table size is recorded as cache_overflow_rate_pct. Table-size tests stop when it reaches --dns-table-overflow-rate-pct.",
             "fill_rate_pct is reported as failure_rate_pct for compatibility with the requested wording.",
         ],
@@ -1331,10 +1357,9 @@ def main():
     # dummy record count deterministic.
     nocache_record_need = 0 if args.dns_skip_nocache else sum(max(1, int(round(float(qps) * float(args.duration)))) for qps in steps)
     cache_record_need = 0 if args.dns_skip_cache else int(args.dns_cache_preload_count)
-    # The table tests are cumulative: later table sizes reuse qnames that were already
-    # introduced by cache_rate preload and by earlier table-size steps.  One max_step
-    # sized range is enough for the cumulative pool, but keep a second range so the
-    # delayed table test can add fresh qnames after the 10 minute interval if needed.
+    # Table tests run before the rate tests and use independent cumulative qname pools.
+    # One max_step-sized range is enough for each pass.  A second disjoint range keeps
+    # the optional delayed pass independent from the immediate table pass.
     table_record_need = 0 if args.dns_skip_table else int(max_step)
     table_delayed_record_need = 0 if (args.dns_skip_table or not args.dns_run_delayed_table) else int(max_step)
     record_margin = max(20000, int(args.dns_cache_preload_count) + int(max_step))
@@ -1422,6 +1447,74 @@ def main():
             if server_proc.poll() is not None:
                 raise RuntimeError(f"DNS server exited before measurement; exit_code={server_proc.returncode}")
 
+            # Run cache-table capacity checks before nocache/cache rate tests.
+            # High-QPS DNS phases can leave queued upstream traffic in the DUT and
+            # can evict or expire entries before the table check begins.
+            table_cached_qnames = []
+            table_cursor = table_start
+            delayed_table_cursor = table_delayed_start
+
+            if not args.dns_skip_table and not args.dns_skip_table_reuse:
+                print("--- DNS cache_table_reuse_size start ---", flush=True)
+                for table_size in steps:
+                    new_qnames, table_cursor = extend_cached_qnames(table_cached_qnames, table_size, table_cursor, args.dns_domain_suffix)
+                    if new_qnames:
+                        preload_before = count_server_queries(server_query_log)
+                        preload = run_client_load_phase("cache_table_reuse_size", "preload_added", table_size, args, target, out_dir, new_qnames, args.dns_table_qps, total_count=len(new_qnames))
+                        preload_after = count_server_queries(server_query_log)
+                        preload_row = decorate_summary(preload, args, target, "cache_table_reuse_size", "preload_added", table_size, preload_before, preload_after, cache_table_size=table_size)
+                        rows.append(preload_row)
+                    verify_qnames = list(table_cached_qnames[:table_size])
+                    before = count_server_queries(server_query_log)
+                    data = run_client_load_phase("cache_table_reuse_size", "verify_reused", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
+                    time.sleep(0.2)
+                    after = count_server_queries(server_query_log)
+                    wan_delta = max(0, after - before)
+                    overflow_pct = overflow_rate_pct(wan_delta, table_size)
+                    overflow = 1 if float(overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct) else 0
+                    row = decorate_summary(data, args, target, "cache_table_reuse_size", "verify_reused", table_size, before, after, cache_table_size=table_size, cache_overflow_detected=overflow, cache_overflow_rate_pct=overflow_pct)
+                    stop_reason = should_stop_table(row, args)
+                    row["stop_reason"] = stop_reason
+                    rows.append(row)
+                    print(f"reuse_table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} stop={stop_reason or '-'}", flush=True)
+                    if stop_reason:
+                        break
+
+            if not args.dns_skip_table and args.dns_run_delayed_table:
+                if float(args.dns_table_reuse_interval_sec) > 0:
+                    print(f"--- DNS cache_table_size interval {args.dns_table_reuse_interval_sec}s start ---", flush=True)
+                    time.sleep(float(args.dns_table_reuse_interval_sec))
+                print("--- DNS cache_table_size start ---", flush=True)
+                delayed_table_cached_qnames = []
+                for table_size in steps:
+                    new_qnames, delayed_table_cursor = extend_cached_qnames(delayed_table_cached_qnames, table_size, delayed_table_cursor, args.dns_domain_suffix)
+                    verify_qnames = list(delayed_table_cached_qnames[:table_size])
+                    # The delayed pass runs after a long idle interval.  Many DUTs expire
+                    # their DNS cache during that interval, so every step must explicitly
+                    # preload the exact qname set that will be verified.  Without this,
+                    # the verify stage merely measures expired-cache misses and reports
+                    # wan_verify ~= table_size even when the cache table itself is fine.
+                    preload_before = count_server_queries(server_query_log)
+                    preload = run_client_load_phase("cache_table_size", "preload_full", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
+                    preload_after = count_server_queries(server_query_log)
+                    preload_row = decorate_summary(preload, args, target, "cache_table_size", "preload_full", table_size, preload_before, preload_after, cache_table_size=table_size)
+                    rows.append(preload_row)
+                    before = count_server_queries(server_query_log)
+                    data = run_client_load_phase("cache_table_size", "verify_reused", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
+                    time.sleep(0.2)
+                    after = count_server_queries(server_query_log)
+                    wan_delta = max(0, after - before)
+                    overflow_pct = overflow_rate_pct(wan_delta, table_size)
+                    overflow = 1 if float(overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct) else 0
+                    row = decorate_summary(data, args, target, "cache_table_size", "verify_reused", table_size, before, after, cache_table_size=table_size, cache_overflow_detected=overflow, cache_overflow_rate_pct=overflow_pct)
+                    stop_reason = should_stop_table(row, args)
+                    row["stop_reason"] = stop_reason
+                    rows.append(row)
+                    print(f"table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} stop={stop_reason or '-'}", flush=True)
+                    if stop_reason:
+                        break
+
+
             cursor = nocache_start
             nocache_rate_qnames = []
             nocache_last_attempted_qps = None
@@ -1476,10 +1569,6 @@ def main():
                 rows.append(row)
                 print(f"nocache_load qps={nocache_load_qps}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% actual_qps={row['actual_qps']:.3f} sent={row['samples_sent']} received={row['samples_received']} timeout={row['timeout_count']} error={row['error_count']} wan={row['wan_queries_delta']}", flush=True)
 
-            cached_qnames = []
-            table_cursor = table_start
-            delayed_table_cursor = table_delayed_start
-
             if not args.dns_skip_cache:
                 print("--- DNS cache_rate start ---", flush=True)
                 cache_qnames = make_qnames(cache_start, args.dns_cache_preload_count, args.dns_domain_suffix)
@@ -1488,7 +1577,6 @@ def main():
                 preload_after = count_server_queries(server_query_log)
                 preload_row = decorate_summary(preload, args, target, "cache_rate", "preload", args.dns_cache_preload_count, preload_before, preload_after, cache_preload_count=args.dns_cache_preload_count)
                 rows.append(preload_row)
-                cached_qnames = dedupe_keep_order(cached_qnames + cache_qnames)
                 print(f"cache preload: success={preload_row['success_rate_pct']:.3f}% wan={preload_row['wan_queries_delta']}", flush=True)
                 for qps in cache_steps:
                     before = count_server_queries(server_query_log)
@@ -1521,65 +1609,6 @@ def main():
                     if stop_reason:
                         break
 
-            if not args.dns_skip_table and not args.dns_skip_table_reuse:
-                print("--- DNS cache_table_reuse_size start ---", flush=True)
-                for table_size in steps:
-                    new_qnames, table_cursor = extend_cached_qnames(cached_qnames, table_size, table_cursor, args.dns_domain_suffix)
-                    if new_qnames:
-                        preload_before = count_server_queries(server_query_log)
-                        preload = run_client_load_phase("cache_table_reuse_size", "preload_added", table_size, args, target, out_dir, new_qnames, args.dns_table_qps, total_count=len(new_qnames))
-                        preload_after = count_server_queries(server_query_log)
-                        preload_row = decorate_summary(preload, args, target, "cache_table_reuse_size", "preload_added", table_size, preload_before, preload_after, cache_table_size=table_size)
-                        rows.append(preload_row)
-                    verify_qnames = list(cached_qnames[:table_size])
-                    before = count_server_queries(server_query_log)
-                    data = run_client_load_phase("cache_table_reuse_size", "verify_reused", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
-                    time.sleep(0.2)
-                    after = count_server_queries(server_query_log)
-                    wan_delta = max(0, after - before)
-                    overflow_pct = overflow_rate_pct(wan_delta, table_size)
-                    overflow = 1 if float(overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct) else 0
-                    row = decorate_summary(data, args, target, "cache_table_reuse_size", "verify_reused", table_size, before, after, cache_table_size=table_size, cache_overflow_detected=overflow, cache_overflow_rate_pct=overflow_pct)
-                    stop_reason = should_stop_table(row, args)
-                    row["stop_reason"] = stop_reason
-                    rows.append(row)
-                    print(f"reuse_table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} stop={stop_reason or '-'}", flush=True)
-                    if stop_reason:
-                        break
-
-            if not args.dns_skip_table and args.dns_run_delayed_table:
-                if float(args.dns_table_reuse_interval_sec) > 0:
-                    print(f"--- DNS cache_table_size interval {args.dns_table_reuse_interval_sec}s start ---", flush=True)
-                    time.sleep(float(args.dns_table_reuse_interval_sec))
-                print("--- DNS cache_table_size start ---", flush=True)
-                delayed_cached_qnames = list(cached_qnames)
-                for table_size in steps:
-                    new_qnames, delayed_table_cursor = extend_cached_qnames(delayed_cached_qnames, table_size, delayed_table_cursor, args.dns_domain_suffix)
-                    verify_qnames = list(delayed_cached_qnames[:table_size])
-                    # The delayed pass runs after a long idle interval.  Many DUTs expire
-                    # their DNS cache during that interval, so every step must explicitly
-                    # preload the exact qname set that will be verified.  Without this,
-                    # the verify stage merely measures expired-cache misses and reports
-                    # wan_verify ~= table_size even when the cache table itself is fine.
-                    preload_before = count_server_queries(server_query_log)
-                    preload = run_client_load_phase("cache_table_size", "preload_full", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
-                    preload_after = count_server_queries(server_query_log)
-                    preload_row = decorate_summary(preload, args, target, "cache_table_size", "preload_full", table_size, preload_before, preload_after, cache_table_size=table_size)
-                    rows.append(preload_row)
-                    before = count_server_queries(server_query_log)
-                    data = run_client_load_phase("cache_table_size", "verify_reused", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
-                    time.sleep(0.2)
-                    after = count_server_queries(server_query_log)
-                    wan_delta = max(0, after - before)
-                    overflow_pct = overflow_rate_pct(wan_delta, table_size)
-                    overflow = 1 if float(overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct) else 0
-                    row = decorate_summary(data, args, target, "cache_table_size", "verify_reused", table_size, before, after, cache_table_size=table_size, cache_overflow_detected=overflow, cache_overflow_rate_pct=overflow_pct)
-                    stop_reason = should_stop_table(row, args)
-                    row["stop_reason"] = stop_reason
-                    rows.append(row)
-                    print(f"table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} stop={stop_reason or '-'}", flush=True)
-                    if stop_reason:
-                        break
         finally:
             if server_proc is not None and server_proc.poll() is None:
                 server_proc.terminate()

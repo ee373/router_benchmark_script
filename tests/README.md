@@ -18,7 +18,7 @@ Individual tests can also be executed directly when debugging a specific subsyst
 | `run_router_bench_v4_stl_throughput_pps.py` | TRex STL IPv4 NAT throughput and PPS benchmark. |
 | `run_router_bench_v4_tcp_scratch_max_sessions.py` | TCP scratch maximum concurrent session benchmark without TRex. Included in the default set and `--run-all`. |
 | `run_router_bench_v4_astf_max_sessions.py` | Legacy TRex ASTF maximum concurrent session benchmark. Launcher execution requires `--run-astf-max-sessions`. |
-| `run_router_bench_v4_astf_sessions_cps.py` | Legacy TRex ASTF short-session CPS benchmark. Launcher execution requires `--run-astf-sessions-cps`. |
+| `run_router_bench_v4_astf_sessions_cps.py` | TRex ASTF short-session CPS benchmark. Included in the default set and `--run-all`; can also be selected with `--run-astf-sessions-cps`. |
 | `run_router_bench_v4_astf_nat_stability.py` | TRex ASTF TCP/UDP NAT stability soak benchmark. |
 | `run_router_bench_v4_iperf3_latency.py` | Linux namespace based TCP/UDP L4 request-response latency benchmark with optional iperf3 load. |
 | `run_router_bench_v4_dns_latency.py` | DNS rate/cache/table benchmark with built-in dummy WAN-side DNS server. |
@@ -30,15 +30,16 @@ The launcher executes tests in this order:
 
 ```text
 01_stl_throughput_pps
-02_astf_max_sessions
-02_astf_sessions_cps
-03_astf_nat_stability
-04_iperf3_l4rr_latency
-05_dns_forwarder_cache_latency
-06_dhcp_scratch_lease_acquisition
+02_tcp_scratch_max_sessions
+02_astf_max_sessions_legacy       # explicit selector only
+03_astf_sessions_cps
+04_astf_nat_stability             # --run-all or explicit selector only
+05_iperf3_l4rr_latency
+06_dns_forwarder_cache_latency
+07_dhcp_scratch_lease_acquisition
 ```
 
-No-option launcher execution runs every default test except ASTF NAT stability. TCP scratch max sessions and DHCP scratch are included in the no-option default set.
+No-option launcher execution runs the default set: STL throughput/PPS, TCP scratch max sessions, ASTF short-session CPS, L4 latency, DNS latency/cache/table, and DHCP scratch. It excludes ASTF NAT stability and the legacy ASTF maximum-session test. `--run-all` adds ASTF NAT stability and enables the delayed DNS table pass and sustained DNS load.
 
 ## Shared target profiles
 
@@ -105,7 +106,8 @@ Performance notes:
 ```text
 The WAN DNS server and LAN DNS client run as separate processes in separate network namespaces.
 The WAN DNS server runs packet response and WAN-query counter publishing separately.
-By default, WAN-side query logs are not suppressed. Rows are accumulated in memory during the full DNS benchmark and written to dns_server_queries.csv when the WAN DNS server exits. The sidecar dns_server_queries.csv.stats.json still counts all WAN-side queries and is used for wan_queries_delta during measurement.
+The counter used by summary_all.csv includes only generated benchmark qnames. Unrelated router-originated DNS traffic remains in dns_server_queries.csv but does not affect cache overflow detection.
+By default, WAN-side query logs are not suppressed. Rows are accumulated in memory during the full DNS benchmark and written to dns_server_queries.csv when the WAN DNS server exits. The sidecar dns_server_queries.csv.stats.json publishes both all_queries and benchmark_queries; benchmark_queries is used for wan_queries_delta during measurement.
 By default, LAN-side measurement keeps only raw send/receive timestamps and minimal DNS status fields during each measurement step. Success rate, failure rate, timeout classification, latency percentiles, and per-query CSV rows are calculated after the timed interval ends. This avoids both per-packet disk I/O and per-packet aggregation work during the timed interval.
 Use --dns-sample-limit 0 or --dns-server-query-log-limit 0 only when intentionally disabling detailed logs. Full WAN query logging can consume significant memory at high QPS and long duration.
 
@@ -242,7 +244,7 @@ Useful options:
 --cores
 ```
 
-## 02: legacy ASTF short-session CPS
+## 03: ASTF short-session CPS
 
 Script:
 
@@ -254,6 +256,7 @@ Purpose:
 
 - Uses TRex ASTF to test short-session NAT creation rate.
 - Runs a short-session CPS search.
+- This benchmark is part of the no-option default set and `--run-all`.
 
 Main outputs:
 
@@ -293,7 +296,7 @@ Useful options:
 --cores
 ```
 
-## 03: ASTF NAT stability soak
+## 04: ASTF NAT stability soak
 
 Script:
 
@@ -372,7 +375,7 @@ Useful options:
 --cores
 ```
 
-## 04: iperf3 L4 request-response latency
+## 05: iperf3 L4 request-response latency
 
 Script:
 
@@ -446,7 +449,7 @@ Useful options:
 --dpdk-driver
 ```
 
-## 05: DNS rate/cache/table benchmark
+## 06: DNS rate/cache/table benchmark
 
 Script:
 
@@ -485,9 +488,22 @@ Example generated name:
 r000000001.routerbench.example.net
 ```
 
-Default DNS subtests:
+Default DNS subtests, in execution order:
 
 ```text
+cache_table_reuse_size:
+  Runs before the DNS rate tests.
+  E6 table-size steps from 10 to 10000 use an independent qname range.
+  Each larger step adds only the missing qnames, then re-queries the whole accumulated pool at 100 QPS.
+  Only generated benchmark qnames are included in wan_queries_delta; unrelated router background DNS traffic is excluded.
+  The subtest stops when failure_rate_pct >= 50 or wan_queries_delta / cache_table_size >= 50%.
+
+cache_table_size:
+  Optional delayed second pass, enabled by --dns-run-delayed-table.
+  It waits 600 seconds by default, then uses a second independent accumulated qname range.
+  Each table-size step preloads the exact qname set and immediately verifies the same set at 100 QPS.
+  The subtest stops when failure_rate_pct >= 50 or wan_queries_delta / cache_table_size >= 50%.
+
 nocache_rate:
   E6 QPS steps: 10,15,22,33,47,68,100,150,220,330,470,680,1000,1500,2200,3300,4700,6800,10000
   Unique qnames are queried for each request.
@@ -499,19 +515,6 @@ cache_rate:
   The same 100 qnames are then queried in round-robin order at cache E6 QPS steps from 10 to 48000.
   Each QPS step uses --duration seconds.
   The subtest stops when failure_rate_pct >= 50 or rtt_max_ms >= 1000.
-
-cache_table_reuse_size:
-  E6 table-size steps from 10 to 10000.
-  The qname pool starts with the 100 qnames preloaded by cache_rate.
-  Each larger step adds only the missing qnames, then re-queries the whole accumulated pool at 100 QPS.
-  WAN-side DNS queries during verify are treated as cache overflow or cache bypass.
-  The subtest stops when failure_rate_pct >= 50 or wan_queries_delta / cache_table_size >= 50%.
-
-cache_table_size:
-  Runs after a 600 second interval by default.
-  It also uses an accumulated qname pool instead of replacing the table at each step. Because this pass runs after the long idle interval, each table-size step first preloads the exact qname set for that step, then immediately verifies the same set at 100 QPS.
-  This checks routers that keep old cache entries until timeout instead of evicting immediately.
-  The subtest stops when failure_rate_pct >= 50 or wan_queries_delta / cache_table_size >= 50%.
 ```
 
 Main outputs:
@@ -626,7 +629,7 @@ Useful options:
 --lan-ip / --lan-gw / --wan-ip / --wan-gw / --router-wan-ip
 ```
 
-## 06: DHCPv4 basic latency using scratch raw socket
+## 07: DHCPv4 basic latency using scratch raw socket
 
 Script:
 
