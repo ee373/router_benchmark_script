@@ -4,10 +4,12 @@
 # Basic speed test launcher.
 #
 # Execution policy:
-#   --run-all              : run the standard full set, including NAT stability and delayed DNS table pass.
-#   no --run-* option      : run the default set, including TCP scratch max-session test but excluding NAT stability.
+#   --run-all              : run the standard full set, including ASTF short-session CPS,
+#                            NAT stability, delayed DNS table pass, and sustained DNS load.
+#   no --run-* option      : run the default set, including TCP scratch max-session test
+#                            and ASTF short-session CPS, but excluding NAT stability.
 #   one or more --run-*    : run only the specified tests, in TEST_PLAN order.
-#   legacy TRex ASTF max-session/CPS tests run only through their dedicated selectors.
+#   legacy TRex ASTF max-session test runs only through its dedicated selector.
 #
 # Example:
 #   sudo python3 ./test_basic_speed.py --target i226_2p5g --duration 20 --repeat 1
@@ -64,18 +66,18 @@ TEST_PLAN = [
     {
         "key": "astf_sessions_cps",
         "run_arg": "run_astf_sessions_cps",
-        "name": "IPv4 ASTF short-session CPS (legacy TRex)",
+        "name": "IPv4 ASTF short-session CPS",
         "script": TESTS_DIR / "run_router_bench_v4_astf_sessions_cps.py",
-        "out_dir_name": "02_astf_sessions_cps_legacy",
-        "default": False,
-        "run_all": False,
+        "out_dir_name": "03_astf_sessions_cps",
+        "default": True,
+        "run_all": True,
     },
     {
         "key": "astf_nat",
         "run_arg": "run_astf_natstability",
         "name": "IPv4 ASTF NAT stability soak",
         "script": TESTS_DIR / "run_router_bench_v4_astf_nat_stability.py",
-        "out_dir_name": "03_astf_nat_stability",
+        "out_dir_name": "04_astf_nat_stability",
         # Long soak test. Excluded from the no-option default set.
         "default": False,
     },
@@ -84,7 +86,7 @@ TEST_PLAN = [
         "run_arg": "run_l4_latency",
         "name": "IPv4 TCP/UDP request-response latency 0/10/20/30/40/50/60/70/80/90/95/99%",
         "script": TESTS_DIR / "run_router_bench_v4_iperf3_latency.py",
-        "out_dir_name": "04_iperf3_l4rr_latency",
+        "out_dir_name": "05_iperf3_l4rr_latency",
         # This script performs post-TRex kernel/netns preparation internally.
         "default": True,
     },
@@ -93,7 +95,7 @@ TEST_PLAN = [
         "run_arg": "run_dns_latency",
         "name": "IPv4 DNS rate/cache/table benchmark",
         "script": TESTS_DIR / "run_router_bench_v4_dns_latency.py",
-        "out_dir_name": "05_dns_forwarder_cache_latency",
+        "out_dir_name": "06_dns_forwarder_cache_latency",
         # This script performs post-TRex kernel/netns preparation internally.
         "default": True,
     },
@@ -102,7 +104,7 @@ TEST_PLAN = [
         "run_arg": "run_dhcp_scratch",
         "name": "IPv4 DHCPv4 basic latency using scratch raw socket",
         "script": TESTS_DIR / "run_router_bench_v4_dhcp_scratch.py",
-        "out_dir_name": "06_dhcp_scratch_lease_acquisition",
+        "out_dir_name": "07_dhcp_scratch_lease_acquisition",
         # Basic DHCP DORA latency is part of the no-option default set.
         "default": True,
     },
@@ -456,7 +458,7 @@ def main():
 
     selection = parser.add_argument_group("test selection")
     selection.add_argument("--run-all", action="store_true",
-                           help="Run all implemented tests, including ASTF NAT stability.")
+                           help="Run the standard full set, including ASTF short-session CPS and ASTF NAT stability.")
     selection.add_argument("--run-stl-throughput", action="store_true",
                            help="Run only/add IPv4 STL throughput/PPS when any individual --run-* option is used.")
     selection.add_argument("--run-tcp-scratch-max-sessions", action="store_true",
@@ -464,7 +466,7 @@ def main():
     selection.add_argument("--run-astf-max-sessions", action="store_true",
                            help="Run only/add legacy TRex ASTF max-session test. This is not included in the default set or --run-all.")
     selection.add_argument("--run-astf-sessions-cps", action="store_true",
-                           help="Run only/add legacy TRex ASTF short-session CPS test. This is not included in the default set or --run-all.")
+                           help="Run only/add IPv4 ASTF short-session CPS test. This is included in the default set and --run-all.")
     selection.add_argument("--run-astf-natstability", action="store_true",
                            help="Run only/add IPv4 ASTF NAT stability soak when any individual --run-* option is used.")
     selection.add_argument("--run-l4-latency", action="store_true",
