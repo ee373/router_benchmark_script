@@ -8,6 +8,8 @@ TRex IPv4 NAT throughput/PPS benchmark - STL only final version.
 - Throughput and PPS only
 - Mbps-based rate search is enabled by default
 - NDR/PDR summary rows are written to summary_all.csv
+- Every rate step performs ARP refresh, explicit-MAC packet construction, NAT-port discovery, and bidirectional connectivity probes
+- Bidirectional measurements report combined, uplink, and downlink statistics
 
 Port mapping:
   port 0 = LAN/client side
@@ -32,6 +34,7 @@ import subprocess
 import sys
 import time
 import traceback
+import zlib
 from pathlib import Path
 
 TREX_DIR = "/opt/trex/v3.08"
@@ -179,7 +182,10 @@ def merge_target_with_overrides(base_target, args):
     if args.line_rate_gbps is not None:
         target["line_rate_gbps"] = args.line_rate_gbps
     if args.cores is not None:
+        # --cores is an explicit runtime override.  Apply it to both the
+        # generic/STL core count and the ASTF-specific default when present.
         target["trex_cores"] = args.cores
+        target["astf_cores"] = args.cores
     return target
 
 
@@ -784,8 +790,15 @@ def metric_int(row, key, default=0):
 
 
 def row_passes(row, loss_threshold):
+    if metric_int(row, "preflight_ok", 1) != 1:
+        return False
+    loss_keys = ["loss_rate"]
+    if metric_int(row, "up_active", 0) == 1:
+        loss_keys.append("up_loss_rate")
+    if metric_int(row, "down_active", 0) == 1:
+        loss_keys.append("down_loss_rate")
     return (
-        metric_float(row, "loss_rate", 1.0) <= loss_threshold
+        all(metric_float(row, key, 1.0) <= loss_threshold for key in loss_keys)
         and metric_int(row, "queue_full", 1) == 0
         and metric_int(row, "ierrors", 1) == 0
         and metric_int(row, "oerrors", 1) == 0
@@ -810,7 +823,23 @@ def first_loss_row(rows, loss_threshold):
 
 
 def copy_best(prefix, row, out):
-    for suffix in ("percent", "mbps", "rx_pps", "l1_bps", "l2_bps", "loss_rate", "pps_reach_rate", "l1_reach_rate"):
+    for suffix in (
+        "percent",
+        "mbps",
+        "rx_pps",
+        "l1_bps",
+        "l2_bps",
+        "loss_rate",
+        "worst_direction_loss_rate",
+        "pps_reach_rate",
+        "l1_reach_rate",
+        "up_rx_pps",
+        "up_l1_bps",
+        "up_loss_rate",
+        "down_rx_pps",
+        "down_l1_bps",
+        "down_loss_rate",
+    ):
         out[f"{prefix}_{suffix}"] = ""
     if row is None:
         return
@@ -820,8 +849,15 @@ def copy_best(prefix, row, out):
     out[f"{prefix}_l1_bps"] = row.get("avg_rx_l1_bps", "")
     out[f"{prefix}_l2_bps"] = row.get("avg_rx_l2_bps", "")
     out[f"{prefix}_loss_rate"] = row.get("loss_rate", "")
+    out[f"{prefix}_worst_direction_loss_rate"] = row.get("worst_direction_loss_rate", "")
     out[f"{prefix}_pps_reach_rate"] = row.get("pps_reach_rate", "")
     out[f"{prefix}_l1_reach_rate"] = row.get("l1_reach_rate", "")
+    out[f"{prefix}_up_rx_pps"] = row.get("up_avg_rx_pps", "")
+    out[f"{prefix}_up_l1_bps"] = row.get("up_avg_rx_l1_bps", "")
+    out[f"{prefix}_up_loss_rate"] = row.get("up_loss_rate", "")
+    out[f"{prefix}_down_rx_pps"] = row.get("down_avg_rx_pps", "")
+    out[f"{prefix}_down_l1_bps"] = row.get("down_avg_rx_l1_bps", "")
+    out[f"{prefix}_down_loss_rate"] = row.get("down_loss_rate", "")
 
 
 def make_rate_search_result(base_name, repeat_index, rows, lossless_threshold):
@@ -839,6 +875,9 @@ def make_rate_search_result(base_name, repeat_index, rows, lossless_threshold):
         "first_loss_percent": "",
         "first_loss_mbps": "",
         "first_loss_loss_rate": "",
+        "first_loss_worst_direction_loss_rate": "",
+        "first_loss_up_loss_rate": "",
+        "first_loss_down_loss_rate": "",
         "first_loss_ierrors": "",
         "first_loss_oerrors": "",
         "first_loss_queue_full": "",
@@ -854,6 +893,9 @@ def make_rate_search_result(base_name, repeat_index, rows, lossless_threshold):
             "first_loss_percent": first_loss.get("rate_percent", ""),
             "first_loss_mbps": first_loss.get("rate_mbps_per_active_port", ""),
             "first_loss_loss_rate": first_loss.get("loss_rate", ""),
+            "first_loss_worst_direction_loss_rate": first_loss.get("worst_direction_loss_rate", ""),
+            "first_loss_up_loss_rate": first_loss.get("up_loss_rate", ""),
+            "first_loss_down_loss_rate": first_loss.get("down_loss_rate", ""),
             "first_loss_ierrors": first_loss.get("ierrors", ""),
             "first_loss_oerrors": first_loss.get("oerrors", ""),
             "first_loss_queue_full": first_loss.get("queue_full", ""),
@@ -893,27 +935,108 @@ def build_refine_steps(rows, lossless_threshold, step):
 def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, rate_mbps_steps,
                   refine_step, lossless_threshold, stop_on_first_loss, single_load_percent):
     add_trex_api_path()
-    from trex.stl.api import STLClient, Ether, IP, UDP, Raw, STLStream, STLPktBuilder, STLTXCont
+    from trex.stl.api import (
+        STLClient,
+        Ether,
+        IP,
+        UDP,
+        Raw,
+        STLStream,
+        STLPktBuilder,
+        STLTXCont,
+        STLTXSingleBurst,
+    )
 
     lan_port = target["lan_port"]
     wan_port = target["wan_port"]
     ports = [lan_port, wan_port]
     line_rate_gbps = float(target["line_rate_gbps"])
 
-    def pkt_up(frame_size):
-        return Ether()/IP(src=target["lan_ip"], dst=target["wan_ip"])/UDP(sport=UDP_PORT, dport=UDP_PORT)/Raw(load=payload_for_l2_size(frame_size))
+    class StepPreflightError(RuntimeError):
+        pass
 
-    def pkt_down(frame_size):
-        return Ether()/IP(src=target["wan_ip"], dst=target["router_wan_ip"])/UDP(sport=UDP_PORT, dport=UDP_PORT)/Raw(load=payload_for_l2_size(frame_size))
+    preflight_fields = [
+        "ts_local",
+        "test_name",
+        "status",
+        "lan_src_mac",
+        "lan_router_mac",
+        "wan_src_mac",
+        "wan_router_mac",
+        "warm_nat_internal_udp_port",
+        "warm_nat_external_udp_port",
+        "warm_nat_tx_pkts",
+        "warm_nat_wan_rx_pkts",
+        "warm_nat_capture_matches",
+        "probe_up_tx_pkts",
+        "probe_up_wan_rx_pkts",
+        "probe_up_capture_matches",
+        "probe_up_success_rate",
+        "probe_up_external_udp_port",
+        "nat_port_changed_after_warm",
+        "probe_down_tx_pkts",
+        "probe_down_lan_rx_pkts",
+        "probe_down_capture_matches",
+        "probe_down_success_rate",
+        "detail",
+    ]
 
-    def make_stream(name, direction, frame_size, pps=None, bps_l1=None):
+    def payload_with_marker(prefix, test_name, frame_size):
+        payload_len = frame_size - 14 - 20 - 8
+        if payload_len < 8:
+            raise ValueError(f"frame_size too small for diagnostic marker: {frame_size}")
+        digest = zlib.crc32(test_name.encode("utf-8")) & 0xFFFFFFFF
+        marker = prefix + digest.to_bytes(4, "big")
+        payload = marker + (b"_" * max(0, payload_len - len(marker)))
+        return marker, payload[:payload_len]
+
+    def normalize_mac(value):
+        value = str(value or "").strip().lower().replace("-", ":")
+        parts = value.split(":")
+        if len(parts) != 6:
+            return ""
+        try:
+            normalized = ":".join(f"{int(part, 16):02x}" for part in parts)
+        except ValueError:
+            return ""
+        if normalized in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+            return ""
+        return normalized
+
+    def pkt_up(frame_size, mac_ctx, udp_sport=UDP_PORT, udp_dport=UDP_PORT, payload=None):
+        if payload is None:
+            payload = payload_for_l2_size(frame_size)
+        return (
+            Ether(src=mac_ctx["lan_src_mac"], dst=mac_ctx["lan_router_mac"])
+            / IP(src=target["lan_ip"], dst=target["wan_ip"])
+            / UDP(sport=int(udp_sport), dport=int(udp_dport))
+            / Raw(load=payload)
+        )
+
+    def pkt_down(frame_size, mac_ctx, nat_external_port, udp_sport=UDP_PORT, payload=None):
+        if payload is None:
+            payload = payload_for_l2_size(frame_size)
+        return (
+            Ether(src=mac_ctx["wan_src_mac"], dst=mac_ctx["wan_router_mac"])
+            / IP(src=target["wan_ip"], dst=target["router_wan_ip"])
+            / UDP(sport=int(udp_sport), dport=int(nat_external_port))
+            / Raw(load=payload)
+        )
+
+    def make_stream(name, direction, frame_size, mac_ctx, nat_external_port=None,
+                    pps=None, bps_l1=None, total_pkts=None, payload=None):
         if direction == "up":
-            packet = pkt_up(frame_size)
+            packet = pkt_up(frame_size, mac_ctx, payload=payload)
         elif direction == "down":
-            packet = pkt_down(frame_size)
+            if nat_external_port is None:
+                raise ValueError("nat_external_port is required for downlink streams")
+            packet = pkt_down(frame_size, mac_ctx, nat_external_port, payload=payload)
         else:
             raise ValueError(direction)
-        if bps_l1 is not None:
+
+        if total_pkts is not None:
+            mode = STLTXSingleBurst(total_pkts=int(total_pkts), pps=float(pps or 1000))
+        elif bps_l1 is not None:
             mode = STLTXCont(bps_L1=bps_l1)
         elif pps is not None:
             mode = STLTXCont(pps=pps)
@@ -927,34 +1050,427 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         except Exception:
             return default
 
-    def calc_summary(test, stats, duration_sec):
-        direction = test["direction"]
-        frame_size = test["frame_size"]
+    def stop_and_remove_streams(client):
+        try:
+            client.stop(ports=ports)
+        except Exception:
+            pass
+        try:
+            client.remove_all_streams(ports=ports)
+        except Exception:
+            pass
+
+    def parse_capture(captured, expected_port, marker):
+        parsed = []
+        for item in captured:
+            try:
+                if int(item.get("port", -1)) != int(expected_port):
+                    continue
+                packet = Ether(item["binary"])
+                if IP not in packet or UDP not in packet:
+                    continue
+                udp_payload = bytes(packet[UDP].payload)
+                if not udp_payload.startswith(marker):
+                    continue
+                parsed.append(packet)
+            except Exception:
+                continue
+        return parsed
+
+    def run_captured_stream(client, stream, tx_port, rx_port, capture_limit,
+                            duration_sec=None, timeout_sec=15):
+        stop_and_remove_streams(client)
+        client.clear_stats(ports=ports)
+        captured = []
+        capture_id = None
+        service_enabled = False
+        primary_error = None
+        capture_error = None
+        try:
+            client.set_service_mode(ports=[rx_port], enabled=True)
+            service_enabled = True
+            capture = client.start_capture(
+                rx_ports=[rx_port],
+                limit=int(capture_limit),
+                mode="fixed",
+                bpf_filter="udp",
+            )
+            capture_id = capture["id"]
+            client.add_streams(stream, ports=[tx_port])
+            time.sleep(0.1)
+            baseline_stats = client.get_stats(ports=ports, sync_now=True)
+            if duration_sec is None:
+                client.start(ports=[tx_port], mult="1")
+                client.wait_on_traffic(ports=[tx_port], timeout=timeout_sec)
+            else:
+                client.start(ports=[tx_port], mult="1", duration=duration_sec)
+                client.wait_on_traffic(ports=[tx_port], timeout=duration_sec + timeout_sec)
+            final_stats = client.get_stats(ports=ports, sync_now=True)
+            delta_stats = subtract_stats(baseline_stats, final_stats)
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                client.stop(ports=[tx_port])
+            except Exception:
+                pass
+            try:
+                client.remove_all_streams(ports=ports)
+            except Exception:
+                pass
+            if capture_id is not None:
+                try:
+                    client.stop_capture(capture_id, captured)
+                except Exception as exc:
+                    capture_error = exc
+            if service_enabled:
+                try:
+                    client.set_service_mode(ports=[rx_port], enabled=False)
+                except Exception:
+                    pass
+            if capture_error is not None and primary_error is None:
+                raise capture_error
+        return delta_stats, captured
+
+    def resolve_step_macs(client):
+        client.set_service_mode(ports=ports, enabled=True)
+        try:
+            client.arp(ports=ports, retries=2)
+        finally:
+            try:
+                client.set_service_mode(ports=ports, enabled=False)
+            except Exception:
+                pass
+
+        mac_ctx = {}
+        for side, port in (("lan", lan_port), ("wan", wan_port)):
+            layer_cfg = client.get_port(port).get_layer_cfg()
+            ether_cfg = layer_cfg.get("ether", {})
+            ipv4_cfg = layer_cfg.get("ipv4", {})
+            src_mac = normalize_mac(ether_cfg.get("src"))
+            router_mac = normalize_mac(ether_cfg.get("dst"))
+            if ipv4_cfg.get("state") != "resolved" or not src_mac or not router_mac:
+                raise RuntimeError(
+                    f"ARP resolution failed on {side} port {port}: "
+                    f"ipv4_state={ipv4_cfg.get('state')} src_mac={src_mac or '(invalid)'} "
+                    f"router_mac={router_mac or '(invalid)'}"
+                )
+            mac_ctx[f"{side}_src_mac"] = src_mac
+            mac_ctx[f"{side}_router_mac"] = router_mac
+        return mac_ctx
+
+    def validate_wan_capture_macs(packets, mac_ctx, phase):
+        router_macs = {normalize_mac(packet[Ether].src) for packet in packets}
+        dst_macs = {normalize_mac(packet[Ether].dst) for packet in packets}
+        router_macs.discard("")
+        dst_macs.discard("")
+        if len(router_macs) != 1:
+            raise RuntimeError(f"{phase}: captured packets contain inconsistent WAN router MACs: {sorted(router_macs)}")
+        observed_router_mac = next(iter(router_macs))
+        if observed_router_mac != mac_ctx["wan_router_mac"]:
+            raise RuntimeError(
+                f"{phase}: WAN router MAC differs from ARP result: "
+                f"arp={mac_ctx['wan_router_mac']} observed={observed_router_mac}"
+            )
+        if dst_macs != {mac_ctx["wan_src_mac"]}:
+            raise RuntimeError(
+                f"{phase}: captured WAN destination MAC differs from TRex WAN MAC: "
+                f"expected={mac_ctx['wan_src_mac']} observed={sorted(dst_macs)}"
+            )
+
+    def warm_nat_and_discover_port(client, test_name, mac_ctx):
+        marker, payload = payload_with_marker(b"RBWN", test_name, FRAME_64)
+        stream = make_stream(
+            f"{test_name}_warm_nat",
+            "up",
+            FRAME_64,
+            mac_ctx,
+            pps=1000,
+            payload=payload,
+        )
+        stats, captured = run_captured_stream(
+            client,
+            stream,
+            tx_port=lan_port,
+            rx_port=wan_port,
+            capture_limit=256,
+            duration_sec=3,
+            timeout_sec=10,
+        )
+        matched = []
+        for packet in parse_capture(captured, wan_port, marker):
+            if (
+                packet[IP].src == target["router_wan_ip"]
+                and packet[IP].dst == target["wan_ip"]
+                and int(packet[UDP].dport) == UDP_PORT
+            ):
+                matched.append(packet)
+
+        tx_pkts = safe_stat(stats, lan_port, "opackets")
+        wan_rx_pkts = safe_stat(stats, wan_port, "ipackets")
+        nat_ports = {int(packet[UDP].sport) for packet in matched}
+        if tx_pkts <= 0 or not matched:
+            raise RuntimeError(
+                f"warm_nat failed: tx_pkts={tx_pkts}, wan_rx_pkts={wan_rx_pkts}, "
+                f"matching_capture_packets={len(matched)}"
+            )
+        if len(nat_ports) != 1:
+            raise RuntimeError(f"warm_nat returned multiple or no translated UDP ports: {sorted(nat_ports)}")
+        validate_wan_capture_macs(matched, mac_ctx, "warm_nat")
+        return {
+            "nat_external_udp_port": next(iter(nat_ports)),
+            "tx_pkts": tx_pkts,
+            "wan_rx_pkts": wan_rx_pkts,
+            "capture_matches": len(matched),
+        }
+
+    def probe_up(client, test_name, mac_ctx):
+        probe_packets = 32
+        marker, payload = payload_with_marker(b"RBUP", test_name, FRAME_64)
+        stream = make_stream(
+            f"{test_name}_probe_up",
+            "up",
+            FRAME_64,
+            mac_ctx,
+            pps=1000,
+            total_pkts=probe_packets,
+            payload=payload,
+        )
+        stats, captured = run_captured_stream(
+            client,
+            stream,
+            tx_port=lan_port,
+            rx_port=wan_port,
+            capture_limit=probe_packets * 4,
+            duration_sec=None,
+            timeout_sec=10,
+        )
+        matched = []
+        for packet in parse_capture(captured, wan_port, marker):
+            if (
+                packet[IP].src == target["router_wan_ip"]
+                and packet[IP].dst == target["wan_ip"]
+                and int(packet[UDP].dport) == UDP_PORT
+            ):
+                matched.append(packet)
+        tx_pkts = safe_stat(stats, lan_port, "opackets")
+        wan_rx_pkts = safe_stat(stats, wan_port, "ipackets")
+        nat_ports = {int(packet[UDP].sport) for packet in matched}
+        success_rate = len(matched) / probe_packets
+        minimum_matches = (probe_packets * 9 + 9) // 10
+        if len(matched) < minimum_matches:
+            raise RuntimeError(
+                f"up probe failed: sent={probe_packets}, tx_pkts={tx_pkts}, "
+                f"wan_rx_pkts={wan_rx_pkts}, matching_capture_packets={len(matched)}"
+            )
+        if len(nat_ports) != 1:
+            raise RuntimeError(f"up probe returned multiple or no translated UDP ports: {sorted(nat_ports)}")
+        validate_wan_capture_macs(matched, mac_ctx, "up probe")
+        return {
+            "nat_external_udp_port": next(iter(nat_ports)),
+            "tx_pkts": tx_pkts,
+            "wan_rx_pkts": wan_rx_pkts,
+            "capture_matches": len(matched),
+            "success_rate": success_rate,
+        }
+
+    def probe_down(client, test_name, mac_ctx, nat_external_port):
+        probe_packets = 32
+        marker, payload = payload_with_marker(b"RBDN", test_name, FRAME_64)
+        stream = make_stream(
+            f"{test_name}_probe_down",
+            "down",
+            FRAME_64,
+            mac_ctx,
+            nat_external_port=nat_external_port,
+            pps=1000,
+            total_pkts=probe_packets,
+            payload=payload,
+        )
+        stats, captured = run_captured_stream(
+            client,
+            stream,
+            tx_port=wan_port,
+            rx_port=lan_port,
+            capture_limit=probe_packets * 4,
+            duration_sec=None,
+            timeout_sec=10,
+        )
+        matched = []
+        for packet in parse_capture(captured, lan_port, marker):
+            if (
+                packet[IP].src == target["wan_ip"]
+                and packet[IP].dst == target["lan_ip"]
+                and int(packet[UDP].sport) == UDP_PORT
+                and int(packet[UDP].dport) == UDP_PORT
+            ):
+                matched.append(packet)
+        tx_pkts = safe_stat(stats, wan_port, "opackets")
+        lan_rx_pkts = safe_stat(stats, lan_port, "ipackets")
+        success_rate = len(matched) / probe_packets
+        minimum_matches = (probe_packets * 9 + 9) // 10
+        if len(matched) < minimum_matches:
+            raise RuntimeError(
+                f"down probe failed: sent={probe_packets}, tx_pkts={tx_pkts}, "
+                f"lan_rx_pkts={lan_rx_pkts}, matching_capture_packets={len(matched)}, "
+                f"nat_external_udp_port={nat_external_port}"
+            )
+        src_macs = {normalize_mac(packet[Ether].src) for packet in matched}
+        dst_macs = {normalize_mac(packet[Ether].dst) for packet in matched}
+        src_macs.discard("")
+        dst_macs.discard("")
+        if src_macs != {mac_ctx["lan_router_mac"]}:
+            raise RuntimeError(
+                f"down probe: LAN router MAC differs from ARP result: "
+                f"expected={mac_ctx['lan_router_mac']} observed={sorted(src_macs)}"
+            )
+        if dst_macs != {mac_ctx["lan_src_mac"]}:
+            raise RuntimeError(
+                f"down probe: LAN destination MAC differs from TRex LAN MAC: "
+                f"expected={mac_ctx['lan_src_mac']} observed={sorted(dst_macs)}"
+            )
+        return {
+            "tx_pkts": tx_pkts,
+            "lan_rx_pkts": lan_rx_pkts,
+            "capture_matches": len(matched),
+            "success_rate": success_rate,
+        }
+
+    def run_preflight(client, test_name, preflight_writer):
+        diag = {
+            "ts_local": ts_iso(),
+            "test_name": test_name,
+            "status": "error",
+            "warm_nat_internal_udp_port": UDP_PORT,
+        }
+        try:
+            client.reset(ports=ports)
+            client.clear_stats(ports=ports)
+            client.remove_all_streams(ports=ports)
+            mac_ctx = resolve_step_macs(client)
+            diag.update(mac_ctx)
+
+            warm = warm_nat_and_discover_port(client, test_name, mac_ctx)
+            warm_nat_port = warm["nat_external_udp_port"]
+            diag.update({
+                "warm_nat_external_udp_port": warm_nat_port,
+                "warm_nat_tx_pkts": warm["tx_pkts"],
+                "warm_nat_wan_rx_pkts": warm["wan_rx_pkts"],
+                "warm_nat_capture_matches": warm["capture_matches"],
+            })
+
+            up = probe_up(client, test_name, mac_ctx)
+            nat_external_port = up["nat_external_udp_port"]
+            diag.update({
+                "probe_up_tx_pkts": up["tx_pkts"],
+                "probe_up_wan_rx_pkts": up["wan_rx_pkts"],
+                "probe_up_capture_matches": up["capture_matches"],
+                "probe_up_success_rate": up["success_rate"],
+                "probe_up_external_udp_port": nat_external_port,
+                "nat_port_changed_after_warm": int(nat_external_port != warm_nat_port),
+            })
+
+            down = probe_down(client, test_name, mac_ctx, nat_external_port)
+            diag.update({
+                "probe_down_tx_pkts": down["tx_pkts"],
+                "probe_down_lan_rx_pkts": down["lan_rx_pkts"],
+                "probe_down_capture_matches": down["capture_matches"],
+                "probe_down_success_rate": down["success_rate"],
+                "status": "ok",
+                "detail": "",
+            })
+            preflight_writer.writerow(diag)
+            return {
+                **mac_ctx,
+                "nat_external_udp_port": nat_external_port,
+                "diag": diag,
+            }
+        except Exception as exc:
+            diag["detail"] = f"{type(exc).__name__}: {exc}"
+            preflight_writer.writerow(diag)
+            raise StepPreflightError(str(exc)) from exc
+
+    def direction_metrics(stats, direction, frame_size, duration_sec, active):
+        if not active:
+            return {
+                "active": 0,
+                "tx_pkts": "",
+                "rx_pkts": "",
+                "tx_bytes": "",
+                "rx_bytes": "",
+                "loss_pkts": "",
+                "loss_rate": "",
+                "avg_tx_pps": "",
+                "avg_rx_pps": "",
+                "avg_rx_l2_bps": "",
+                "avg_rx_l1_bps": "",
+                "theoretical_pps": "",
+                "pps_reach_rate": "",
+                "theoretical_l1_bps": "",
+                "l1_reach_rate": "",
+            }
         if direction == "up":
-            tx_ports, rx_ports, active_directions = [lan_port], [wan_port], 1
+            tx_port, rx_port = lan_port, wan_port
         elif direction == "down":
-            tx_ports, rx_ports, active_directions = [wan_port], [lan_port], 1
-        elif direction == "bidir":
-            tx_ports, rx_ports, active_directions = [lan_port, wan_port], [lan_port, wan_port], 2
+            tx_port, rx_port = wan_port, lan_port
         else:
             raise ValueError(direction)
-        tx_pkts = sum(safe_stat(stats, p, "opackets") for p in tx_ports)
-        rx_pkts = sum(safe_stat(stats, p, "ipackets") for p in rx_ports)
-        tx_bytes = sum(safe_stat(stats, p, "obytes") for p in tx_ports)
-        rx_bytes = sum(safe_stat(stats, p, "ibytes") for p in rx_ports)
+        tx_pkts = safe_stat(stats, tx_port, "opackets")
+        rx_pkts = safe_stat(stats, rx_port, "ipackets")
+        tx_bytes = safe_stat(stats, tx_port, "obytes")
+        rx_bytes = safe_stat(stats, rx_port, "ibytes")
         loss_pkts = max(0, tx_pkts - rx_pkts)
-        loss_rate = (loss_pkts / tx_pkts) if tx_pkts else 0.0
+        loss_rate = loss_pkts / tx_pkts if tx_pkts else 0.0
         avg_tx_pps = tx_pkts / duration_sec if duration_sec > 0 else 0.0
         avg_rx_pps = rx_pkts / duration_sec if duration_sec > 0 else 0.0
         avg_rx_l2_bps = (rx_bytes * 8) / duration_sec if duration_sec > 0 else 0.0
         avg_rx_l1_bps = avg_rx_pps * (frame_size + L1_OVERHEAD_BYTES) * 8
-        theoretical_pps = theoretical_pps_per_port(line_rate_gbps, frame_size) * active_directions
-        theoretical_l1_bps = line_rate_gbps * 1_000_000_000 * active_directions
+        theoretical_pps = theoretical_pps_per_port(line_rate_gbps, frame_size)
+        theoretical_l1_bps = line_rate_gbps * 1_000_000_000
+        return {
+            "active": 1,
+            "tx_pkts": tx_pkts,
+            "rx_pkts": rx_pkts,
+            "tx_bytes": tx_bytes,
+            "rx_bytes": rx_bytes,
+            "loss_pkts": loss_pkts,
+            "loss_rate": loss_rate,
+            "avg_tx_pps": avg_tx_pps,
+            "avg_rx_pps": avg_rx_pps,
+            "avg_rx_l2_bps": avg_rx_l2_bps,
+            "avg_rx_l1_bps": avg_rx_l1_bps,
+            "theoretical_pps": theoretical_pps,
+            "pps_reach_rate": avg_rx_pps / theoretical_pps if theoretical_pps else 0.0,
+            "theoretical_l1_bps": theoretical_l1_bps,
+            "l1_reach_rate": avg_rx_l1_bps / theoretical_l1_bps if theoretical_l1_bps else 0.0,
+        }
+
+    def calc_summary(test, stats, duration_sec, preflight):
+        direction = test["direction"]
+        frame_size = test["frame_size"]
+        up = direction_metrics(stats, "up", frame_size, duration_sec, direction in ("up", "bidir"))
+        down = direction_metrics(stats, "down", frame_size, duration_sec, direction in ("down", "bidir"))
+        active_metrics = [metrics for metrics in (up, down) if metrics["active"]]
+        tx_pkts = sum(metrics["tx_pkts"] for metrics in active_metrics)
+        rx_pkts = sum(metrics["rx_pkts"] for metrics in active_metrics)
+        tx_bytes = sum(metrics["tx_bytes"] for metrics in active_metrics)
+        rx_bytes = sum(metrics["rx_bytes"] for metrics in active_metrics)
+        loss_pkts = max(0, tx_pkts - rx_pkts)
+        loss_rate = loss_pkts / tx_pkts if tx_pkts else 0.0
+        avg_tx_pps = sum(metrics["avg_tx_pps"] for metrics in active_metrics)
+        avg_rx_pps = sum(metrics["avg_rx_pps"] for metrics in active_metrics)
+        avg_rx_l2_bps = sum(metrics["avg_rx_l2_bps"] for metrics in active_metrics)
+        avg_rx_l1_bps = sum(metrics["avg_rx_l1_bps"] for metrics in active_metrics)
+        theoretical_pps = sum(metrics["theoretical_pps"] for metrics in active_metrics)
+        theoretical_l1_bps = sum(metrics["theoretical_l1_bps"] for metrics in active_metrics)
+        worst_direction_loss_rate = max(metrics["loss_rate"] for metrics in active_metrics)
         try:
             queue_full = stats["global"].get("queue_full", 0)
         except Exception:
             queue_full = 0
-        return {
+
+        result = {
             "phase": "stl_rate_search" if rate_search else "stl_single_load",
             "test_name": test["name"],
             "base_test_name": test.get("base_name", test["name"]),
@@ -972,6 +1488,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             "rx_bytes": rx_bytes,
             "loss_pkts": loss_pkts,
             "loss_rate": loss_rate,
+            "worst_direction_loss_rate": worst_direction_loss_rate,
             "avg_tx_pps": avg_tx_pps,
             "avg_rx_pps": avg_rx_pps,
             "avg_rx_l2_bps": avg_rx_l2_bps,
@@ -981,59 +1498,90 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             "theoretical_l1_bps": theoretical_l1_bps,
             "l1_reach_rate": avg_rx_l1_bps / theoretical_l1_bps if theoretical_l1_bps else 0.0,
             "queue_full": queue_full,
-            "ierrors": sum(safe_stat(stats, p, "ierrors") for p in ports),
-            "oerrors": sum(safe_stat(stats, p, "oerrors") for p in ports),
+            "ierrors": sum(safe_stat(stats, port, "ierrors") for port in ports),
+            "oerrors": sum(safe_stat(stats, port, "oerrors") for port in ports),
+            "lan_ierrors": safe_stat(stats, lan_port, "ierrors"),
+            "lan_oerrors": safe_stat(stats, lan_port, "oerrors"),
+            "wan_ierrors": safe_stat(stats, wan_port, "ierrors"),
+            "wan_oerrors": safe_stat(stats, wan_port, "oerrors"),
+            "preflight_ok": 1,
+            "lan_src_mac": preflight["lan_src_mac"],
+            "lan_router_mac": preflight["lan_router_mac"],
+            "wan_src_mac": preflight["wan_src_mac"],
+            "wan_router_mac": preflight["wan_router_mac"],
+            "nat_internal_udp_port": UDP_PORT,
+            "nat_external_udp_port": preflight["nat_external_udp_port"],
+            "warm_nat_capture_matches": preflight["diag"].get("warm_nat_capture_matches", ""),
+            "probe_up_success_rate": preflight["diag"].get("probe_up_success_rate", ""),
+            "probe_down_success_rate": preflight["diag"].get("probe_down_success_rate", ""),
+            "nat_port_changed_after_warm": preflight["diag"].get("nat_port_changed_after_warm", ""),
         }
+        for prefix, metrics in (("up", up), ("down", down)):
+            for key, value in metrics.items():
+                result[f"{prefix}_{key}"] = value
+        return result
 
-    def try_arp(client):
-        try:
-            client.set_service_mode(ports=ports, enabled=True)
-            client.arp(ports=ports)
-        except Exception:
-            print("WARNING: automatic ARP failed. Check link, IP/gateway, and router ARP behavior.")
-            print(traceback.format_exc())
-        finally:
-            try:
-                client.set_service_mode(ports=ports, enabled=False)
-            except Exception:
-                pass
-
-    def warm_nat(client, seconds=3):
-        client.reset(ports=ports)
-        client.clear_stats()
-        client.remove_all_streams(ports=ports)
-        client.add_streams(make_stream("warm_nat_up", "up", FRAME_64, pps=1000), ports=[lan_port])
-        client.start(ports=[lan_port], mult="1", duration=seconds)
-        client.wait_on_traffic(ports=[lan_port], timeout=seconds + 10)
-        client.remove_all_streams(ports=ports)
-
-    def run_one_test(client, test, raw_writer):
+    def run_one_test(client, test, raw_writer, preflight_writer):
         name = test["name"]
         direction = test["direction"]
         frame_size = test["frame_size"]
         bps_l1 = test.get("bps_l1", None)
         rate_mbps = test.get("rate_mbps", "")
         rate_percent = test.get("rate_percent", "")
-        print(f"=== STL {name}: direction={direction}, frame={frame_size}, rate={fmt_rate_value(rate_mbps)}Mbps ({rate_percent:g}%), bps_L1={bps_l1}, duration={duration}s ===")
-        if direction in ("down", "bidir"):
-            warm_nat(client, seconds=3)
-        client.reset(ports=ports)
-        client.clear_stats()
-        client.remove_all_streams(ports=ports)
+        print(
+            f"=== STL {name}: direction={direction}, frame={frame_size}, "
+            f"rate={fmt_rate_value(rate_mbps)}Mbps ({rate_percent:g}%), "
+            f"bps_L1={bps_l1}, duration={duration}s ==="
+        )
+        print(f"--- Preflight {name}: ARP, explicit MAC, warm NAT, NAT port discovery, up/down probe ---")
+        preflight = run_preflight(client, name, preflight_writer)
+        nat_external_port = preflight["nat_external_udp_port"]
+
+        stop_and_remove_streams(client)
+        client.clear_stats(ports=ports)
         if direction == "up":
-            client.add_streams(make_stream(f"{name}_up", "up", frame_size, bps_l1=bps_l1), ports=[lan_port])
+            client.add_streams(
+                make_stream(f"{name}_up", "up", frame_size, preflight, bps_l1=bps_l1),
+                ports=[lan_port],
+            )
             active_ports = [lan_port]
         elif direction == "down":
-            # Keep NAT binding alive during downlink. This 1pps stream is not counted in downlink summary.
-            client.add_streams(make_stream(f"{name}_keepalive", "up", FRAME_64, pps=1), ports=[lan_port])
-            client.add_streams(make_stream(f"{name}_down", "down", frame_size, bps_l1=bps_l1), ports=[wan_port])
+            client.add_streams(
+                make_stream(f"{name}_keepalive", "up", FRAME_64, preflight, pps=1),
+                ports=[lan_port],
+            )
+            client.add_streams(
+                make_stream(
+                    f"{name}_down",
+                    "down",
+                    frame_size,
+                    preflight,
+                    nat_external_port=nat_external_port,
+                    bps_l1=bps_l1,
+                ),
+                ports=[wan_port],
+            )
             active_ports = [lan_port, wan_port]
         elif direction == "bidir":
-            client.add_streams(make_stream(f"{name}_up", "up", frame_size, bps_l1=bps_l1), ports=[lan_port])
-            client.add_streams(make_stream(f"{name}_down", "down", frame_size, bps_l1=bps_l1), ports=[wan_port])
+            client.add_streams(
+                make_stream(f"{name}_up", "up", frame_size, preflight, bps_l1=bps_l1),
+                ports=[lan_port],
+            )
+            client.add_streams(
+                make_stream(
+                    f"{name}_down",
+                    "down",
+                    frame_size,
+                    preflight,
+                    nat_external_port=nat_external_port,
+                    bps_l1=bps_l1,
+                ),
+                ports=[wan_port],
+            )
             active_ports = [lan_port, wan_port]
         else:
             raise ValueError(direction)
+
         time.sleep(0.2)
         baseline_stats = client.get_stats(ports=ports, sync_now=True)
         start_time = time.time()
@@ -1053,7 +1601,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         except Exception:
             pass
         client.remove_all_streams(ports=ports)
-        return calc_summary(test, delta_stats, duration)
+        return calc_summary(test, delta_stats, duration, preflight)
 
     base_tests = [
         {"base_name": "large_down_throughput", "direction": "down", "frame_size": FRAME_LARGE},
@@ -1065,21 +1613,29 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
     ]
 
     raw_csv = out_dir / "stl_raw.csv"
+    preflight_csv = out_dir / "stl_preflight.csv"
     summaries = []
     client = STLClient(server="127.0.0.1")
     client.connect()
     try:
         client.acquire(ports=ports, force=True)
         client.reset(ports=ports)
-        try_arp(client)
-        with open(raw_csv, "w", newline="") as raw_file:
+        with open(raw_csv, "w", newline="") as raw_file, open(
+            preflight_csv, "w", newline=""
+        ) as preflight_file:
             raw_writer = csv.writer(raw_file)
             raw_writer.writerow(["ts_local", "elapsed_sec", "phase", "test_name", "metric", "value"])
+            preflight_writer = csv.DictWriter(preflight_file, fieldnames=preflight_fields, extrasaction="ignore")
+            preflight_writer.writeheader()
             for r in range(1, repeat + 1):
                 for base in base_tests:
                     if rate_search:
                         step_rows = []
-                        for rate_point in build_rate_points(line_rate_gbps, rate_steps=rate_steps, rate_mbps_steps=rate_mbps_steps):
+                        for rate_point in build_rate_points(
+                            line_rate_gbps,
+                            rate_steps=rate_steps,
+                            rate_mbps_steps=rate_mbps_steps,
+                        ):
                             pct = rate_point["rate_percent"]
                             mbps = rate_point["rate_mbps"]
                             bps_l1 = rate_point["bps_l1"]
@@ -1096,27 +1652,33 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                                 "bps_l1": bps_l1,
                             }
                             try:
-                                row = run_one_test(client, test, raw_writer)
+                                row = run_one_test(client, test, raw_writer, preflight_writer)
                                 summaries.append(row)
                                 step_rows.append(row)
                                 if stop_on_first_loss and not row_passes(row, lossless_threshold):
-                                    print(f"Stopping {base['base_name']} at {fmt_rate_value(mbps)}Mbps ({pct:g}%) because loss/error was detected.")
+                                    print(
+                                        f"Stopping {base['base_name']} at {fmt_rate_value(mbps)}Mbps "
+                                        f"({pct:g}%) because loss/error was detected."
+                                    )
                                     break
-                            except Exception:
+                            except Exception as exc:
                                 error_row = {
                                     "phase": "stl_rate_search",
                                     "repeat": r,
                                     "test_name": test["name"],
                                     "base_test_name": base["base_name"],
+                                    "direction": base["direction"],
                                     "rate_percent": pct,
                                     "rate_mbps_per_active_port": mbps,
+                                    "preflight_ok": 0 if isinstance(exc, StepPreflightError) else 1,
+                                    "error_stage": "preflight" if isinstance(exc, StepPreflightError) else "measurement",
                                     "error": traceback.format_exc(),
                                 }
                                 print(error_row["error"])
                                 summaries.append(error_row)
                             raw_file.flush()
+                            preflight_file.flush()
                             time.sleep(5)
-                        # Optional refinement between last NDR and first lossy point.
                         for pct in build_refine_steps(step_rows, lossless_threshold, refine_step):
                             bps_l1 = line_rate_gbps * 1_000_000_000 * (pct / 100.0)
                             mbps = (line_rate_gbps * 1000.0) * (pct / 100.0)
@@ -1132,22 +1694,26 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                                 "bps_l1": bps_l1,
                             }
                             try:
-                                row = run_one_test(client, test, raw_writer)
+                                row = run_one_test(client, test, raw_writer, preflight_writer)
                                 summaries.append(row)
                                 step_rows.append(row)
-                            except Exception:
+                            except Exception as exc:
                                 error_row = {
                                     "phase": "stl_rate_search_refine",
                                     "repeat": r,
                                     "test_name": test["name"],
                                     "base_test_name": base["base_name"],
+                                    "direction": base["direction"],
                                     "rate_percent": pct,
                                     "rate_mbps_per_active_port": mbps,
+                                    "preflight_ok": 0 if isinstance(exc, StepPreflightError) else 1,
+                                    "error_stage": "preflight" if isinstance(exc, StepPreflightError) else "measurement",
                                     "error": traceback.format_exc(),
                                 }
                                 print(error_row["error"])
                                 summaries.append(error_row)
                             raw_file.flush()
+                            preflight_file.flush()
                             time.sleep(5)
                         summaries.append(make_rate_search_result(base["base_name"], r, step_rows, lossless_threshold))
                     else:
@@ -1166,33 +1732,33 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                             "bps_l1": bps_l1,
                         }
                         try:
-                            summaries.append(run_one_test(client, test, raw_writer))
-                        except Exception:
+                            summaries.append(run_one_test(client, test, raw_writer, preflight_writer))
+                        except Exception as exc:
                             error_row = {
                                 "phase": "stl_single_load",
                                 "repeat": r,
                                 "test_name": test["name"],
                                 "base_test_name": base["base_name"],
+                                "direction": base["direction"],
                                 "rate_percent": pct,
                                 "rate_mbps_per_active_port": mbps,
+                                "preflight_ok": 0 if isinstance(exc, StepPreflightError) else 1,
+                                "error_stage": "preflight" if isinstance(exc, StepPreflightError) else "measurement",
                                 "error": traceback.format_exc(),
                             }
                             print(error_row["error"])
                             summaries.append(error_row)
                         raw_file.flush()
+                        preflight_file.flush()
                         time.sleep(5)
     finally:
-        try:
-            client.stop(ports=ports)
-        except Exception:
-            pass
+        stop_and_remove_streams(client)
         try:
             client.reset(ports=ports)
         except Exception:
             pass
         client.disconnect()
     return summaries
-
 
 def write_summary_csv(path, summaries):
     keys = []
@@ -1216,6 +1782,17 @@ def write_metadata(out_dir, target_name, target, args):
         "trex_dir": TREX_DIR,
         "trex_cfg_path": TREX_CFG_PATH,
         "mode": "stl_only_throughput_pps",
+        "per_step_preflight": {
+            "arp_refresh": True,
+            "explicit_mac_headers": True,
+            "warm_nat_seconds": 3,
+            "nat_udp_port_capture": True,
+            "uplink_probe_packets": 32,
+            "downlink_probe_packets": 32,
+            "minimum_probe_capture_rate": 0.9,
+            "output": "stl_preflight.csv",
+        },
+        "directional_statistics": ["combined", "up", "down"],
         "tests": [
             "large_down_throughput",
             "large_up_throughput",
@@ -1353,6 +1930,7 @@ def main():
     print(f"Result directory : {out_dir}")
     print(f"Summary CSV      : {summary_csv}")
     print(f"Raw CSV          : {out_dir / 'stl_raw.csv'}")
+    print(f"Preflight CSV    : {out_dir / 'stl_preflight.csv'}")
     print(f"Metadata         : {out_dir / 'metadata.json'}")
     print(f"TRex server log  : {out_dir / 'trex_server_stl.log'}")
 

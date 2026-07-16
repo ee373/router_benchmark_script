@@ -54,7 +54,10 @@ No-option launcher execution runs the default set: STL throughput/PPS, TCP scrat
 | `lan_port`, `wan_port` | TRex port numbers. |
 | `lan_ip`, `lan_gw`, `wan_ip`, `wan_gw`, `router_wan_ip` | Addressing used by namespace tests and metadata. |
 | `line_rate_gbps` | Line rate used by load percentage calculations. |
-| `trex_cores` | Default TRex core count. |
+| `trex_cores` | Default TRex core count used by STL and as the ASTF fallback. |
+| `astf_cores` | Optional ASTF-specific DP core count. The X540 profile uses 1 because its ASTF client/server pools contain one address per side; STL retains 2 cores for 10GbE. |
+
+The `--cores` option is an explicit override and sets both `trex_cores` and `astf_cores`. For normal `x540_10g` execution, omit `--cores`: STL starts with 2 DP cores and ASTF starts with 1 DP core.
 
 Direct L2 loop baseline profiles are also defined for L4 latency baseline measurement:
 
@@ -80,12 +83,17 @@ Purpose:
 - Measures throughput and PPS for 64-byte and large-frame traffic.
 - Performs Mbps-based rate search by default.
 - Writes NDR/PDR summary rows.
+- Before every rate step, refreshes ARP on both ports and writes explicit source/destination MAC addresses into every generated frame.
+- Before every rate step, sends warm-up NAT traffic, captures the WAN-side translated UDP source port, and uses that port for downlink traffic.
+- Before every rate step, verifies 32 uplink packets and 32 downlink packets. A failed preflight prevents that measurement step from starting.
+- Bidirectional rows include combined counters and independent `up_*` / `down_*` counters and loss rates.
 
 Main outputs:
 
 ```text
 summary_all.csv
 stl_raw.csv
+stl_preflight.csv
 metadata.json
 trex_cfg.yaml
 trex_interface_prepare.csv
