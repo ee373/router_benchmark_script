@@ -83,12 +83,17 @@ Purpose:
 - Measures throughput and PPS for 64-byte and large-frame traffic.
 - Performs Mbps-based rate search by default.
 - Writes NDR/PDR summary rows.
+- Before every rate step, refreshes ARP on both ports and writes explicit source/destination MAC addresses into every generated frame.
+- Before every rate step, sends warm-up NAT traffic, captures the WAN-side translated UDP source port, and uses that port for downlink traffic.
+- Before every rate step, verifies 32 uplink packets and 32 downlink packets. A failed preflight prevents that measurement step from starting.
+- Bidirectional rows include combined counters and independent `up_*` / `down_*` counters and loss rates.
 
 Main outputs:
 
 ```text
 summary_all.csv
 stl_raw.csv
+stl_preflight.csv
 metadata.json
 trex_cfg.yaml
 trex_interface_prepare.csv
