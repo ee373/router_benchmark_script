@@ -54,6 +54,7 @@ try:
         parse_interfaces,
         prepare_trex_interfaces_from_profile,
         require_root,
+        resolve_astf_cores,
         run_astf_profile,
         ts_compact,
         ts_iso,
@@ -90,6 +91,7 @@ except Exception:
         parse_interfaces,
         prepare_trex_interfaces_from_profile,
         require_root,
+        resolve_astf_cores,
         run_astf_profile,
         ts_compact,
         ts_iso,
@@ -474,6 +476,7 @@ def main():
     print(f"Target              : {args.target}")
     print(f"Description         : {target['description']}")
     print(f"Interfaces          : {target['interfaces']}")
+    print(f"ASTF DP cores       : {resolve_astf_cores(target)}")
     print(f"LAN/client          : port {target['lan_port']} / {target['lan_ip']} gw {target['lan_gw']}")
     print(f"WAN/server          : port {target['wan_port']} / {target['wan_ip']} gw {target['wan_gw']}")
     print(f"Router WAN IP       : {target['router_wan_ip']}")
@@ -497,7 +500,7 @@ def main():
     write_metadata(out_dir, args.target, target, args)
 
     summaries = []
-    server = TrexAstfServer(cores=int(target["trex_cores"]), out_dir=out_dir)
+    server = TrexAstfServer(cores=resolve_astf_cores(target), out_dir=out_dir)
     try:
         server.start()
         summaries.extend(run_astf_cps_tests(target=target, out_dir=out_dir, args=args))

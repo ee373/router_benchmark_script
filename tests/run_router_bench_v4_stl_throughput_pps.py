@@ -179,7 +179,10 @@ def merge_target_with_overrides(base_target, args):
     if args.line_rate_gbps is not None:
         target["line_rate_gbps"] = args.line_rate_gbps
     if args.cores is not None:
+        # --cores is an explicit runtime override.  Apply it to both the
+        # generic/STL core count and the ASTF-specific default when present.
         target["trex_cores"] = args.cores
+        target["astf_cores"] = args.cores
     return target
 
 

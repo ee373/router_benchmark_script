@@ -66,6 +66,7 @@ try:
         parse_interfaces,
         prepare_trex_interfaces_from_profile,
         require_root,
+        resolve_astf_cores,
         ts_compact,
         ts_iso,
         try_arp,
@@ -87,6 +88,7 @@ except Exception:
         parse_interfaces,
         prepare_trex_interfaces_from_profile,
         require_root,
+        resolve_astf_cores,
         ts_compact,
         ts_iso,
         try_arp,
@@ -1172,6 +1174,7 @@ def main():
     print(f"Target              : {args.target}")
     print(f"Description         : {target['description']}")
     print(f"Interfaces          : {target['interfaces']}")
+    print(f"ASTF DP cores       : {resolve_astf_cores(target)}")
     print(f"LAN/client          : port {target['lan_port']} / {target['lan_ip']} gw {target['lan_gw']}")
     print(f"WAN/server          : port {target['wan_port']} / {target['wan_ip']} gw {target['wan_gw']}")
     print(f"Router WAN IP       : {target['router_wan_ip']}")
@@ -1204,7 +1207,7 @@ def main():
     install_trex_cfg(target, out_dir, args.no_install_cfg)
     write_metadata(out_dir, args.target, target, args, bytes_per_session)
 
-    server = TrexAstfServer(cores=int(target["trex_cores"]), out_dir=out_dir)
+    server = TrexAstfServer(cores=resolve_astf_cores(target), out_dir=out_dir)
     try:
         server.start()
         cycle_rows, summary_row, protocol_results = run_nat_stability_test(target=target, out_dir=out_dir, args=args)

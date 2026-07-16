@@ -86,6 +86,19 @@ DEFAULT_STABLE_LOSS_THRESHOLD = 0.001
 DEFAULT_REPRESENTATIVE_CPS = None
 
 
+def resolve_astf_cores(target):
+    """Return the DP core count used by ASTF tests.
+
+    Profiles may keep a higher ``trex_cores`` value for STL throughput while
+    selecting fewer cores for ASTF.  This is required when the ASTF IP
+    generator uses a single client/server address: TRex cannot split a
+    one-address pool across multiple DP threads.
+    """
+    cores = int(target.get("astf_cores", target["trex_cores"]))
+    if cores <= 0:
+        raise ValueError("ASTF core count must be positive")
+    return cores
+
 
 def progress_bar_from_ratio(ratio, width=PROGRESS_BAR_WIDTH):
     ratio = max(0.0, min(1.0, float(ratio)))

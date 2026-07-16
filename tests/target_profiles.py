@@ -62,7 +62,12 @@ TARGETS = {
         "wan_ip": "192.168.100.1",
         "wan_gw": "192.168.100.2",
         "router_wan_ip": "192.168.100.2",
+        # STL needs two DP cores to cover 10GbE.  ASTF currently uses one
+        # client/server address per side, so keep ASTF on one DP core like
+        # the i226 profiles.  TRex requires each ASTF IP pool to contain
+        # more addresses than the number of DP threads.
         "trex_cores": 2,
+        "astf_cores": 1,
     },
 }
 

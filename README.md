@@ -42,6 +42,8 @@ sudo python3 test_basic_speed.py \
   --duration 30
 ```
 
+For `x540_10g`, STL uses two DP cores while ASTF tests use one DP core by default. The ASTF profile uses one client and one server IP address, matching the working i226 configuration. An explicit `--cores` value overrides both defaults.
+
 NAT stability duration is controlled with `--soak-duration-sec`:
 
 ```bash
