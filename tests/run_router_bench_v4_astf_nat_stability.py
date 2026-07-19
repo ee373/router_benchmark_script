@@ -51,6 +51,17 @@ except Exception:
     from target_profiles import TARGETS  # type: ignore
 
 try:
+    from tests.routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+except Exception:
+    from routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+
+try:
     from tests.run_router_bench_v4_astf_sessions_cps import (  # type: ignore
         ASTF_TCP_PORT,
         RAW_INTERVAL_SEC,
@@ -122,6 +133,11 @@ CYCLE_CSV_FIELDS = [
     "cycle_index",
     "protocol",
     "test_name",
+    "preflight_ok",
+    "preflight_session_success_rate",
+    "preflight_payload_completion_rate",
+    "preflight_packet_loss_rate",
+    "preflight_throughput_loss_rate",
     "test_elapsed_total_sec",
     "protocol_elapsed_sec",
     "cycle_elapsed_sec",
@@ -641,6 +657,7 @@ def run_one_cycle(client, profile, raw_writer, args, target, protocol, cycle_ind
     test_name = f"{protocol}_cycle_{cycle_index:06d}_nat_stability_{int(args.cycle_sessions)}flow_{args.cycle_cps:g}cps_{args.mb_per_session:g}MB"
 
     client.reset()
+    try_arp(client, client.get_acquired_ports())
     client.load_profile(profile)
     client.clear_stats()
 
@@ -936,16 +953,74 @@ def print_cycle_line(protocol, cycle_index, row, args, elapsed_after_cycle, rema
     )
 
 
+
+def run_protocol_roundtrip_preflight(client, raw_writer, args, target, protocol, cycle_index):
+    """Run a small protocol-matched ASTF request/reply canary before each soak cycle."""
+    pre_args = argparse.Namespace(**vars(args))
+    pre_args.cycle_cps = min(5.0, max(1.0, float(args.cycle_cps)))
+    pre_args.cycle_sessions = min(5, max(1, int(args.cycle_sessions)))
+    pre_args.mb_per_session = min(0.001, max(0.000001, float(args.mb_per_session)))
+    pre_args.connect_timeout_sec = max(1.0, min(3.0, float(args.connect_timeout_sec)))
+    pre_args.completion_quiet_sec = min(0.5, float(args.completion_quiet_sec))
+    pre_args.generation_grace_sec = min(2.0, float(args.generation_grace_sec))
+    pre_args.sample_interval_sec = min(0.25, float(args.sample_interval_sec))
+    pre_args.stable_success_threshold = 0.80
+    pre_args.stable_loss_threshold = 0.20
+    pre_args.payload_completion_threshold = 0.80
+    pre_bytes = 1200 if protocol == "udp" else 4096
+    profile = make_nat_stability_profile(protocol, target, pre_args, pre_bytes)
+    row = run_one_cycle(
+        client=client,
+        profile=profile,
+        raw_writer=raw_writer,
+        args=pre_args,
+        target=target,
+        protocol=protocol,
+        cycle_index=0,
+        protocol_start_monotonic=time.time(),
+        test_start_monotonic=time.time(),
+        bytes_per_session=pre_bytes,
+    )
+    result = {
+        "preflight_ok": int(
+            float(row.get("session_success_rate") or 0.0) >= 0.80
+            and float(row.get("payload_completion_rate") or 0.0) >= 0.80
+        ),
+        "preflight_session_success_rate": row.get("session_success_rate", 0.0),
+        "preflight_payload_completion_rate": row.get("payload_completion_rate", 0.0),
+        "preflight_packet_loss_rate": row.get("packet_loss_rate", 0.0),
+        "preflight_throughput_loss_rate": row.get("throughput_loss_rate", 0.0),
+    }
+    raw_writer.writerow([
+        ts_iso(), "", f"astf_nat_stability_{protocol}_preflight",
+        f"{protocol}_cycle_{cycle_index:06d}_preflight", "summary",
+        json.dumps(result, ensure_ascii=False, default=str),
+    ])
+    if not result["preflight_ok"]:
+        raise RuntimeError(
+            f"ASTF {protocol} round-trip preflight failed before cycle {cycle_index}: {result}"
+        )
+    return result
+
 def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir, protocol, test_start, bytes_per_session):
     profile = make_nat_stability_profile(protocol, target, args, bytes_per_session)
     protocol_start = time.time()
     rows = []
     cycle_index = 1
+    preflight_elapsed_total = 0.0
     while True:
-        elapsed_total = time.time() - protocol_start
+        elapsed_total = time.time() - protocol_start - preflight_elapsed_total
         if elapsed_total >= float(args.soak_duration_sec):
             break
         try:
+            preflight_started = time.time()
+            try:
+                preflight = run_protocol_roundtrip_preflight(
+                    client=client, raw_writer=raw_writer, args=args, target=target,
+                    protocol=protocol, cycle_index=cycle_index,
+                )
+            finally:
+                preflight_elapsed_total += time.time() - preflight_started
             row = run_one_cycle(
                 client=client,
                 profile=profile,
@@ -954,10 +1029,11 @@ def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir,
                 target=target,
                 protocol=protocol,
                 cycle_index=cycle_index,
-                protocol_start_monotonic=protocol_start,
+                protocol_start_monotonic=protocol_start + preflight_elapsed_total,
                 test_start_monotonic=test_start,
                 bytes_per_session=bytes_per_session,
             )
+            row.update(preflight)
         except Exception:
             row = {
                 "ts_local_start": ts_iso(),
@@ -966,11 +1042,12 @@ def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir,
                 "protocol": protocol,
                 "test_name": f"{protocol}_cycle_{cycle_index:06d}_nat_stability_error",
                 "test_elapsed_total_sec": time.time() - test_start,
-                "protocol_elapsed_sec": time.time() - protocol_start,
+                "protocol_elapsed_sec": time.time() - protocol_start - preflight_elapsed_total,
                 "completion_reason": "exception",
                 "cycle_completed": False,
                 "cycle_timeout": False,
                 "cycle_stable": False,
+                "preflight_ok": 0,
                 "requested_cps": float(args.cycle_cps),
                 "requested_sessions": int(args.cycle_sessions),
                 "payload_direction": args.payload_direction,
@@ -988,7 +1065,7 @@ def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir,
         cycle_writer.writerow({field: row.get(field, "") for field in CYCLE_CSV_FIELDS})
         raw_writer.writerow([ts_iso(), "", f"astf_nat_stability_{protocol}", row.get("test_name", ""), "cycle_summary", json.dumps(row, ensure_ascii=False, default=str)])
 
-        elapsed_after_cycle = time.time() - protocol_start
+        elapsed_after_cycle = time.time() - protocol_start - preflight_elapsed_total
         remaining_after_cycle = max(0.0, float(args.soak_duration_sec) - elapsed_after_cycle)
         print_cycle_line(protocol, cycle_index, row, args, elapsed_after_cycle, remaining_after_cycle)
 
@@ -1008,7 +1085,7 @@ def run_nat_stability_test(target, out_dir, args):
     ports = [target["lan_port"], target["wan_port"]]
 
     bytes_per_session = resolve_bytes_per_session(args)
-    test_start = time.time()
+    test_start = None
 
     rows = []
     protocol_results = {}
@@ -1017,6 +1094,8 @@ def run_nat_stability_test(target, out_dir, args):
     try:
         client.reset()
         try_arp(client, ports)
+        wait_before_test_start(args.test_start_delay_sec, "ASTF NAT stability benchmark")
+        test_start = time.time()
 
         for protocol in args.protocols:
             paths = protocol_result_paths(out_dir, protocol)
@@ -1059,7 +1138,7 @@ def run_nat_stability_test(target, out_dir, args):
             pass
         client.disconnect()
 
-    summary_row = make_summary_row(rows, args, time.time() - test_start)
+    summary_row = make_summary_row(rows, args, time.time() - test_start if test_start is not None else 0.0)
     return rows, summary_row, protocol_results
 
 
@@ -1067,6 +1146,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run TRex ASTF IPv4 NAT stability soak test.")
     parser.add_argument("--target", choices=TARGETS.keys(), default="i226_2p5g")
     parser.add_argument("--out-dir", default="")
+    parser.add_argument("--test-start-delay-sec", type=parse_non_negative_float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after TRex ports report link-up and before testing. Default: 15.")
     parser.add_argument("--soak-duration-sec",
                         dest="soak_duration_sec", type=parse_positive_float,
                         default=DEFAULT_SOAK_DURATION_SEC,

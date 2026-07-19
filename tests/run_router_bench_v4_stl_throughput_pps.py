@@ -60,6 +60,16 @@ try:
 except Exception:
     from target_profiles import TARGETS  # type: ignore
 
+try:
+    from tests.routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+except Exception:
+    from routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
 
 
 def ts_compact():
@@ -693,6 +703,49 @@ def tail_text(path, max_lines=80):
     return "\n".join(lines[-int(max_lines):])
 
 
+def _trex_link_up_from_attr(attr):
+    if not isinstance(attr, dict):
+        return False
+    for key in ("link_up", "is_link_up", "up"):
+        value = attr.get(key)
+        if isinstance(value, bool):
+            return value
+    link = attr.get("link")
+    if isinstance(link, bool):
+        return link
+    if isinstance(link, str):
+        return link.strip().upper() == "UP"
+    if isinstance(link, dict):
+        for key in ("up", "link_up", "is_up"):
+            value = link.get(key)
+            if isinstance(value, bool):
+                return value
+        status = link.get("status") or link.get("state")
+        if isinstance(status, str):
+            return status.strip().upper() == "UP"
+    return False
+
+
+def wait_trex_ports_link_up(client, ports, timeout_sec=45.0, poll_interval_sec=0.5):
+    deadline = time.monotonic() + float(timeout_sec)
+    last = {}
+    while time.monotonic() < deadline:
+        all_up = True
+        last = {}
+        for port in ports:
+            try:
+                attr = client.get_port_attr(port)
+            except Exception as exc:
+                attr = {"error": str(exc)}
+            last[port] = attr
+            if not _trex_link_up_from_attr(attr):
+                all_up = False
+        if all_up:
+            return last
+        time.sleep(float(poll_interval_sec))
+    raise RuntimeError(f"TRex port link did not become UP within {timeout_sec:g}s: {last}")
+
+
 class TrexStlServer:
     def __init__(self, cores, out_dir):
         self.cores = cores
@@ -703,7 +756,7 @@ class TrexStlServer:
 
     def start(self):
         kill_existing_trex()
-        cmd = ["./t-rex-64", "-i", "-c", str(self.cores)]
+        cmd = ["./t-rex-64", "-i", "-c", str(self.cores), "--arp-refresh-period", "60"]
         self.log_file = open(self.log_path, "w")
         print("=== Starting TRex STL mode ===")
         print(" ".join(cmd))
@@ -933,7 +986,8 @@ def build_refine_steps(rows, lossless_threshold, step):
 
 
 def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, rate_mbps_steps,
-                  refine_step, lossless_threshold, stop_on_first_loss, single_load_percent):
+                  refine_step, lossless_threshold, stop_on_first_loss, single_load_percent,
+                  test_start_delay_sec=DEFAULT_TEST_START_DELAY_SEC):
     add_trex_api_path()
     from trex.stl.api import (
         STLClient,
@@ -1134,6 +1188,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         return delta_stats, captured
 
     def resolve_step_macs(client):
+        wait_trex_ports_link_up(client, ports)
         client.set_service_mode(ports=ports, enabled=True)
         try:
             client.arp(ports=ports, retries=2)
@@ -1619,7 +1674,9 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
     client.connect()
     try:
         client.acquire(ports=ports, force=True)
+        wait_trex_ports_link_up(client, ports)
         client.reset(ports=ports)
+        wait_before_test_start(test_start_delay_sec, "STL throughput/PPS benchmark")
         with open(raw_csv, "w", newline="") as raw_file, open(
             preflight_csv, "w", newline=""
         ) as preflight_file:
@@ -1811,6 +1868,8 @@ def main():
     parser.add_argument("--out-dir", default="", help="Result directory. Default: /var/trex/trex_stl_throughput_pps_<target>_<timestamp>/.")
     parser.add_argument("--duration", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--test-start-delay-sec", type=float, default=DEFAULT_TEST_START_DELAY_SEC,
+                        help="Seconds to wait after TRex ports report link-up and before the first measured test. Default: 15.")
 
     parser.add_argument("--rate-search", dest="rate_search", action="store_true", help="Enable rate search. Default: enabled.")
     parser.add_argument("--stl-rate-search", dest="rate_search", action="store_true", help="Compatibility alias for --rate-search.")
@@ -1855,6 +1914,8 @@ def main():
         raise SystemExit("ERROR: --single-load-percent must be 0 < value <= 100")
     if args.refine_step < 0:
         raise SystemExit("ERROR: --refine-step must be >= 0")
+    if args.test_start_delay_sec < 0:
+        raise SystemExit("ERROR: --test-start-delay-sec must be >= 0")
 
     target = merge_target_with_overrides(TARGETS[args.target], args)
     if args.rate_search and args.rate_steps is None:
@@ -1916,6 +1977,7 @@ def main():
                 lossless_threshold=args.lossless_threshold,
                 stop_on_first_loss=args.stop_on_first_loss,
                 single_load_percent=args.single_load_percent,
+                test_start_delay_sec=args.test_start_delay_sec,
             )
         )
     finally:

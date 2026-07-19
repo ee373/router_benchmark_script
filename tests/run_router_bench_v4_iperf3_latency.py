@@ -60,6 +60,22 @@ try:
 except Exception:
     from target_profiles import TARGETS  # type: ignore
 
+try:
+    from tests.routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+except Exception:
+    from routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+
+try:
+    from tests.routerbench_arp_refresh import NamespaceArpRefresher, DEFAULT_ARP_REFRESH_INTERVAL_SEC  # type: ignore
+except Exception:
+    from routerbench_arp_refresh import NamespaceArpRefresher, DEFAULT_ARP_REFRESH_INTERVAL_SEC  # type: ignore
+
 
 try:
     from tests.run_router_bench_v4_stl_throughput_pps import prepare_trex_interfaces_from_profile  # type: ignore
@@ -854,6 +870,28 @@ def wait_test_interfaces_ready(args):
         return
     wait_namespace_interface_ready(args.lan_ns, args.lan_iface, args.interface_ready_timeout_sec)
     wait_namespace_interface_ready(args.wan_ns, args.wan_iface, args.interface_ready_timeout_sec)
+
+
+def make_namespace_arp_refresher(args, target, out_dir):
+    endpoints = [
+        {
+            "namespace": args.lan_ns,
+            "iface": args.lan_iface,
+            "src_ip": target["lan_ip"],
+            "target_ip": target["lan_gw"],
+        },
+        {
+            "namespace": args.wan_ns,
+            "iface": args.wan_iface,
+            "src_ip": target["wan_ip"],
+            "target_ip": target["router_wan_ip"],
+        },
+    ]
+    return NamespaceArpRefresher(
+        endpoints=endpoints,
+        log_path=Path(out_dir) / "arp_refresh.csv",
+        interval_sec=DEFAULT_ARP_REFRESH_INTERVAL_SEC,
+    )
 
 
 def percentile(values, pct):
@@ -1799,6 +1837,7 @@ def main():
     parser.add_argument("--l4rr-preflight-duration-sec", type=parse_positive_float, default=DEFAULT_L4RR_PREFLIGHT_DURATION_SEC)
     parser.add_argument("--l4rr-preflight-interval-sec", type=parse_positive_float, default=DEFAULT_L4RR_PREFLIGHT_INTERVAL_SEC)
     parser.add_argument("--post-namespace-settle-sec", type=parse_non_negative_float, default=DEFAULT_POST_NAMESPACE_SETTLE_SEC)
+    parser.add_argument("--test-start-delay-sec", type=parse_non_negative_float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after namespace interfaces report link-up and before testing. Default: 15.")
     parser.add_argument("--wait-interfaces-ready", dest="wait_interfaces_ready", action="store_true", default=True, help="Wait until namespace interfaces report UP/LOWER_UP. Enabled by default.")
     parser.add_argument("--no-wait-interfaces-ready", dest="wait_interfaces_ready", action="store_false", help="Do not wait for namespace interface readiness.")
     parser.add_argument("--interface-ready-timeout-sec", type=parse_positive_float, default=DEFAULT_INTERFACE_READY_TIMEOUT_SEC)
@@ -1888,6 +1927,7 @@ def main():
         print(f"Output          : {out_dir}")
         print("============================================================")
 
+        arp_refresher = None
         try:
             if args.setup_namespaces:
                 setup_namespaces(args, target, ns_log)
@@ -1895,11 +1935,16 @@ def main():
             wait_test_interfaces_ready(args)
             if args.post_namespace_settle_sec > 0:
                 time.sleep(args.post_namespace_settle_sec)
+            wait_before_test_start(args.test_start_delay_sec, "L4 latency benchmark")
+            arp_refresher = make_namespace_arp_refresher(args, target, out_dir)
+            arp_refresher.refresh_now("startup", required=True)
+            arp_refresher.start()
 
             idle_requested, loaded_percentages = split_load_percentages(args.load_percentages)
             idle_row = None
             if idle_requested and not args.skip_idle:
                 print("--- idle TCP/UDP request-response latency start: load_percent=0 ---", flush=True)
+                arp_refresher.refresh_now("before_idle", required=True)
                 idle_row = run_l4rr_phase("idle", args, target, out_dir, tool_load="none", load_percent=0, computed_load_bps=0)
                 rows.append(idle_row)
                 print(
@@ -1918,6 +1963,7 @@ def main():
                     phase = phase_for_load_percent(load_percent)
                     load_rate, computed_load_bps = effective_load_rate(args, target, load_percent)
                     print(f"--- {phase} TCP/UDP request-response latency start: iperf3_rate={load_rate} ---", flush=True)
+                    arp_refresher.refresh_now(f"before_{phase}", required=True)
                     loaded_row = run_loaded_phase(
                         phase,
                         args,
@@ -1942,6 +1988,8 @@ def main():
                 for loaded_row in loaded_rows:
                     rows.append(make_delta_row(idle_row, loaded_row, args, target))
         finally:
+            if arp_refresher is not None:
+                arp_refresher.stop()
             cleanup_namespaces(args, ns_log)
             if getattr(args, "restore_dpdk_after", True):
                 if prepare_trex_interfaces_from_profile is None:

@@ -39,6 +39,17 @@ except Exception:
     from target_profiles import TARGETS  # type: ignore
 
 try:
+    from tests.routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+except Exception:
+    from routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+
+try:
     from tests.run_router_bench_v4_stl_throughput_pps import (  # type: ignore
         DEFAULT_RESULT_ROOT,
         parse_interfaces,
@@ -80,6 +91,7 @@ except Exception:
 
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
+ETH_P_ARP = 0x0806
 ETH_P_8021Q = 0x8100
 UDP_PROTO = 17
 DHCP_CLIENT_PORT = 68
@@ -258,6 +270,41 @@ def build_dhcp_frame(src_mac, dst_mac, dhcp_payload, src_ip=ZERO_IP, dst_ip=BROA
     ip = build_ipv4_header(src_ip, dst_ip, len(udp)) + udp
     eth = add_vlan_headers(dst_b, src_b, int(vlan), int(qinq), ETH_P_IP)
     return eth + ip
+
+
+def build_arp_request_frame(src_mac, src_ip, target_ip, vlan=-1, qinq=-1):
+    src_b = mac_to_bytes(src_mac)
+    eth = add_vlan_headers(BROADCAST_MAC, src_b, int(vlan), int(qinq), ETH_P_ARP)
+    arp = struct.pack(
+        "!HHBBH6s4s6s4s",
+        1, ETH_P_IP, 6, 4, 1,
+        src_b, ip_to_bytes(src_ip), b"\x00" * 6, ip_to_bytes(target_ip),
+    )
+    return eth + arp
+
+
+def helper_send_arp_refresh(sock, client, vlan, qinq, events):
+    leased_ip = client.get("leased_ip") or client.get("offered_ip")
+    if not leased_ip:
+        return
+    targets = []
+    server_id = client.get("server_id") or client.get("server_ip")
+    if server_id and server_id != ZERO_IP:
+        targets.append(server_id)
+    targets.append(leased_ip)
+    for target_ip in dict.fromkeys(targets):
+        try:
+            frame = build_arp_request_frame(client["mac"], leased_ip, target_ip, vlan=vlan, qinq=qinq)
+            sock.send(frame)
+            events.append({
+                "ts_local": ts_iso(), "event": "arp_refresh_sent", "mac": client["mac"],
+                "leased_ip": leased_ip, "target_ip": target_ip,
+            })
+        except Exception as exc:
+            events.append({
+                "ts_local": ts_iso(), "event": "arp_refresh_error", "mac": client.get("mac", ""),
+                "leased_ip": leased_ip, "target_ip": target_ip, "error": str(exc),
+            })
 
 
 def parse_dhcp_options(raw):
@@ -477,6 +524,7 @@ def scratch_dhcp_exchange(iface, clients, mac_base, timeout_sec, poll_interval_s
                 state["server_ip"] = pkt.get("src_ip") or state.get("server_ip") or ""
                 state["server_mac"] = pkt.get("server_mac") or state.get("server_mac") or ""
                 state["lease_time_sec"] = pkt.get("lease_time_sec", "")
+                helper_send_arp_refresh(sock, state, vlan, qinq, events)
             elif msg_type == 6:
                 state["nak"] = True
                 state["nak_rx_ts"] = now
@@ -797,6 +845,7 @@ def run(args):
         print("============================================================")
         try:
             setup_dhcp_namespace(args, target, ns_log)
+            wait_before_test_start(args.test_start_delay_sec, "DHCP scratch benchmark")
             print(f"LAN interface   : {args.lan_iface}", flush=True)
             trial_no = 0
             for rep in range(int(args.dhcp_single_repeats)):
@@ -871,6 +920,7 @@ def build_arg_parser():
     parser.add_argument("--dhcp-ns", default="rb_dhcp", help="Network namespace used for scratch DHCP client.")
     parser.add_argument("--interface-ready-timeout-sec", type=float, default=10.0)
     parser.add_argument("--post-namespace-settle-sec", type=float, default=2.0)
+    parser.add_argument("--test-start-delay-sec", type=float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after the DHCP namespace interface reports link-up and before testing. Default: 15.")
     parser.add_argument("--no-auto-kernel-bind", action="store_true", help="Do not bind profile PCI devices back to kernel drivers before DHCP.")
     parser.add_argument("--restore-dpdk-after", dest="restore_dpdk_after", action="store_true", default=True)
     parser.add_argument("--no-restore-dpdk-after", dest="restore_dpdk_after", action="store_false")
@@ -917,6 +967,8 @@ def validate_args(args):
         raise SystemExit("ERROR: --dhcp-reconnect-repeats must be >= 0")
     if args.dhcp_reconnect_wait_sec < 0:
         raise SystemExit("ERROR: --dhcp-reconnect-wait-sec must be >= 0")
+    if args.test_start_delay_sec < 0:
+        raise SystemExit("ERROR: --test-start-delay-sec must be >= 0")
     if args.dhcp_burst_clients <= 0:
         raise SystemExit("ERROR: --dhcp-burst-clients must be positive")
     if args.dhcp_timeout_sec <= 0:

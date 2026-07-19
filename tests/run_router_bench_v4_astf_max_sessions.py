@@ -25,6 +25,17 @@ except Exception:
     from target_profiles import TARGETS  # type: ignore
 
 try:
+    from tests.routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+except Exception:
+    from routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+
+try:
     from tests.run_router_bench_v4_astf_lib import (  # type: ignore
         ASTF_TCP_PORT,
         DEFAULT_MAX_SESSIONS,
@@ -48,6 +59,7 @@ try:
         require_root,
         resolve_astf_cores,
         run_astf_profile,
+        run_astf_roundtrip_preflight,
         make_long_session_profile,
         ts_compact,
         ts_iso,
@@ -77,6 +89,7 @@ except Exception:
         require_root,
         resolve_astf_cores,
         run_astf_profile,
+        run_astf_roundtrip_preflight,
         make_long_session_profile,
         ts_compact,
         ts_iso,
@@ -396,6 +409,14 @@ def run_max_session_test(client, target, raw_writer, max_session_writer, args, r
     print(f"Total duration     : {duration:.3f}s")
     print("============================================================")
 
+    preflight = run_astf_roundtrip_preflight(
+        client=client,
+        target=target,
+        raw_writer=raw_writer,
+        test_name=test_name,
+        tcp_port=args.astf_tcp_port,
+    )
+
     profile = make_long_session_profile(
         target=target,
         cps=args.session_ramp_cps,
@@ -442,6 +463,7 @@ def run_max_session_test(client, target, raw_writer, max_session_writer, args, r
         "session_hold_sec": args.session_hold_sec,
         "keepalive_payload_bytes_each_direction": 1,
         "keepalive_interval_sec": 1,
+        **preflight,
         "max_sessions_requested": args.max_sessions,
         "max_session_summary_source": "not_summarized_see_astf_max_sessions_timeseries_csv",
         "max_session_result_mode": "per_second_timeseries_csv",
@@ -480,6 +502,7 @@ def run_astf_max_session_tests(target, out_dir, args):
     try:
         client.reset()
         try_arp(client, ports)
+        wait_before_test_start(args.test_start_delay_sec, "ASTF maximum-session benchmark")
         with open(raw_csv, "w", newline="") as raw_file, open(max_session_timeseries_csv, "w", newline="") as max_session_file:
             raw_writer = csv.writer(raw_file)
             raw_writer.writerow(["ts_local", "elapsed_sec", "phase", "test_name", "metric", "value"])
@@ -548,6 +571,7 @@ def main():
     parser.add_argument("--target", choices=TARGETS.keys(), default="i226_1g")
     parser.add_argument("--out-dir", default="", help="Result directory. Default: /var/trex/trex_astf_max_sessions_<target>_<timestamp>/.")
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--test-start-delay-sec", type=float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after TRex ports report link-up and before testing. Default: 15.")
     parser.add_argument("--no-install-cfg", action="store_true")
     parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=True, help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
     parser.add_argument("--no-auto-dpdk-bind", dest="auto_dpdk_bind", action="store_false", help="Do not attempt DPDK driver binding before starting TRex. Stale benchmark namespaces are still removed.")
@@ -583,6 +607,8 @@ def main():
 
     if args.repeat <= 0:
         raise SystemExit("ERROR: --repeat must be positive")
+    if args.test_start_delay_sec < 0:
+        raise SystemExit("ERROR: --test-start-delay-sec must be >= 0")
     if args.max_sessions <= 0 or args.max_sessions > 65535:
         raise SystemExit("ERROR: --max-sessions must be 1..65535")
     if args.session_ramp_cps <= 0:

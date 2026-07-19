@@ -46,6 +46,7 @@ try:
         ts_iso,
         tail_text,
         wait_rpc,
+        wait_trex_ports_link_up,
     )
 except Exception:
     from run_router_bench_v4_stl_throughput_pps import (  # type: ignore
@@ -64,6 +65,7 @@ except Exception:
         ts_iso,
         tail_text,
         wait_rpc,
+        wait_trex_ports_link_up,
     )
 
 RAW_INTERVAL_SEC = 1.0
@@ -178,7 +180,7 @@ class TrexAstfServer:
 
     def start(self):
         kill_existing_trex()
-        cmd = ["./t-rex-64", "-i", "--astf", "-c", str(self.cores)]
+        cmd = ["./t-rex-64", "-i", "--astf", "-c", str(self.cores), "--arp-refresh-period", "60"]
         self.log_file = open(self.log_path, "w")
         print("=== Starting TRex ASTF mode ===")
         print(" ".join(cmd))
@@ -769,13 +771,87 @@ def make_short_session_profile(target, cps, tcp_port):
     return ASTFProfile(default_ip_gen=ip_gen, templates=template, default_c_glob_info=info, default_s_glob_info=info)
 
 
-def try_arp(client, ports):
+
+DEFAULT_ASTF_PREFLIGHT_CPS = 5.0
+DEFAULT_ASTF_PREFLIGHT_DURATION_SEC = 2.0
+DEFAULT_ASTF_PREFLIGHT_MIN_SUCCESS_RATE = 0.90
+
+
+def run_astf_roundtrip_preflight(
+    client, target, raw_writer, test_name, tcp_port=ASTF_TCP_PORT,
+    cps=DEFAULT_ASTF_PREFLIGHT_CPS, duration_sec=DEFAULT_ASTF_PREFLIGHT_DURATION_SEC,
+    minimum_success_rate=DEFAULT_ASTF_PREFLIGHT_MIN_SUCCESS_RATE,
+):
+    """Run a small TCP request/reply profile before a measured ASTF step.
+
+    ASTF owns the translated tuple and Ethernet headers, so external NAT-port
+    discovery and explicit packet MAC fields are not applicable.  This canary
+    validates the applicable requirements instead: ARP resolution, TCP/NAT
+    establishment, client-to-server payload, and server-to-client payload.
+    """
+    cps = max(1.0, float(cps))
+    duration_sec = max(1.0, float(duration_sec))
+    expected_sessions = max(1, int(cps * duration_sec))
+    profile = make_short_session_profile(target=target, cps=cps, tcp_port=tcp_port)
+    stats = run_astf_profile(
+        client=client,
+        profile=profile,
+        phase="astf_roundtrip_preflight",
+        test_name=f"{test_name}_preflight",
+        duration=duration_sec,
+        raw_writer=raw_writer,
+        wait_timeout_extra=15,
+        nc=False,
+        t_duration=1.0,
+    )
+    metrics = calc_astf_metrics(
+        stats,
+        requested_cps=cps,
+        duration_sec=duration_sec,
+        expected_sessions=expected_sessions,
+    )
+    checks = {
+        "session_success": float(metrics.get("session_success_rate") or 0.0) >= float(minimum_success_rate),
+        "client_to_server_payload": float(metrics.get("client_tx_l7_bytes") or 0.0) > 0.0 and float(metrics.get("server_rx_l7_bytes") or 0.0) > 0.0,
+        "server_to_client_payload": float(metrics.get("server_tx_l7_bytes") or 0.0) > 0.0 and float(metrics.get("client_rx_l7_bytes") or 0.0) > 0.0,
+    }
+    result = {
+        "preflight_ok": int(all(checks.values())),
+        "preflight_expected_sessions": expected_sessions,
+        "preflight_established_sessions": metrics.get("established_sessions", 0),
+        "preflight_session_success_rate": metrics.get("session_success_rate", 0.0),
+        "preflight_packet_loss_rate": metrics.get("packet_loss_rate", 0.0),
+        "preflight_throughput_loss_rate": metrics.get("throughput_loss_rate", 0.0),
+        "preflight_client_tx_l7_bytes": metrics.get("client_tx_l7_bytes", 0),
+        "preflight_server_rx_l7_bytes": metrics.get("server_rx_l7_bytes", 0),
+        "preflight_server_tx_l7_bytes": metrics.get("server_tx_l7_bytes", 0),
+        "preflight_client_rx_l7_bytes": metrics.get("client_rx_l7_bytes", 0),
+        "preflight_checks": checks,
+    }
+    raw_writer.writerow([
+        ts_iso(), "", "astf_roundtrip_preflight", f"{test_name}_preflight",
+        "summary", json.dumps(result, ensure_ascii=False, default=str),
+    ])
+    if not result["preflight_ok"]:
+        raise RuntimeError(
+            f"ASTF round-trip preflight failed before {test_name}: "
+            f"success={result['preflight_session_success_rate']}, checks={checks}"
+        )
+    return result
+
+def try_arp(client, ports, required=True):
+    wait_trex_ports_link_up(client, ports)
     try:
         client.set_service_mode(ports=ports, enabled=True)
-        client.arp(ports=ports)
+        client.arp(ports=ports, retries=2)
+        return True
     except Exception:
+        detail = traceback.format_exc()
         print("WARNING: automatic ARP failed. Check link, IP/gateway, and router ARP behavior.")
-        print(traceback.format_exc())
+        print(detail)
+        if required:
+            raise
+        return False
     finally:
         try:
             client.set_service_mode(ports=ports, enabled=False)
@@ -790,6 +866,7 @@ def run_astf_profile(client, profile, phase, test_name, duration, raw_writer,
                      progress_ramp_sec=None, progress_session_ramp_cps=None,
                      progress_max_sessions=None, return_samples=False):
     client.reset()
+    try_arp(client, client.get_acquired_ports())
     client.load_profile(profile)
     client.clear_stats()
     start_time = time.time()

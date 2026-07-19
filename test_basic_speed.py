@@ -130,6 +130,7 @@ LAUNCHER_OPTIONS = {
     "--target",
     "--out-dir",
     "--dry-run",
+    "--test-start-delay-sec",
     "--soak-duration-sec",
     *RUN_SELECTOR_OPTIONS,
 }
@@ -165,12 +166,13 @@ def ensure_dir(path):
         ) from exc
 
 
-def write_launcher_metadata(parent_out_dir, target, enabled_tests, passthrough_args, dry_run, selection_mode):
+def write_launcher_metadata(parent_out_dir, target, enabled_tests, passthrough_args, dry_run, selection_mode, test_start_delay_sec):
     metadata = {
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
         "target": target,
         "dry_run": bool(dry_run),
         "selection_mode": selection_mode,
+        "test_start_delay_sec": float(test_start_delay_sec),
         "passthrough_args": list(passthrough_args),
         "tests": [
             {
@@ -455,6 +457,8 @@ def main():
                         help="Parent result directory. Default: /var/trex/trex_basic_speed_<target>_<timestamp>/. A child directory is created for each test.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without executing them.")
+    parser.add_argument("--test-start-delay-sec", type=float, default=15.0,
+                        help="Seconds each child test waits after link-up before sending benchmark traffic. Default: 15.")
 
     selection = parser.add_argument_group("test selection")
     selection.add_argument("--run-all", action="store_true",
@@ -487,6 +491,9 @@ def main():
     args, passthrough_args = parser.parse_known_args()
     reject_invalid_launcher_options(passthrough_args)
 
+    if args.test_start_delay_sec < 0:
+        raise SystemExit("ERROR: --test-start-delay-sec must be >= 0")
+
     enabled_tests, selection_mode = select_tests(args)
     validate_launcher_option_combination(args, enabled_tests)
     validate_passthrough_args(passthrough_args, enabled_tests)
@@ -502,6 +509,7 @@ def main():
     print(f"Target         : {args.target}")
     print(f"Selection mode : {selection_mode}")
     print(f"Parent out dir : {parent_out_dir}")
+    print(f"Start delay    : {args.test_start_delay_sec:g}s after link-up per test")
     print(f"Passthrough    : {' '.join(passthrough_args) if passthrough_args else '(none)'}")
 
     if not args.dry_run:
@@ -512,6 +520,7 @@ def main():
             passthrough_args=passthrough_args,
             dry_run=args.dry_run,
             selection_mode=selection_mode,
+            test_start_delay_sec=args.test_start_delay_sec,
         )
 
     if enabled_tests:
@@ -559,6 +568,7 @@ def main():
             str(script),
             "--target", args.target,
             "--out-dir", str(child_out_dir),
+            "--test-start-delay-sec", str(args.test_start_delay_sec),
         ]
         cmd.extend(child_passthrough_args)
 
