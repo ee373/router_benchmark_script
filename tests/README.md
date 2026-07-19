@@ -1,3 +1,17 @@
+## 通信事前確認の適用範囲
+
+各項目は、試験方式に適用できる場合だけ実装する。
+
+| 試験 | 適用する確認 | 適用しない項目と理由 |
+|---|---|---|
+| STL throughput/PPS | ステップごとのARP、明示MAC、NAT外部UDPポート取得、warm NAT成功判定、上り・下り32パケット確認、方向別統計 | なし |
+| ASTF max sessions / CPS | 各測定前の小規模TCP往復事前試験。接続成功と両方向L7バイトを確認 | NAT外部ポートと明示MACはASTF/TRexが動的に管理するため対象外 |
+| ASTF NAT stability | 各サイクル前に同一プロトコル・同一payload directionの小規模往復事前試験 | NAT外部ポートと明示MACはASTF/TRexが動的に管理するため対象外 |
+| TCP scratch max sessions | 本測定前に単一TCP接続でUP要求とDOWN応答を確認 | カーネルTCP/IPがNATポートとEthernetヘッダーを管理するため外部ポート取得・明示MACは対象外 |
+| L4 latency | 各フェーズ前の既存TCP/UDP request-response preflight | カーネルソケット試験のため外部ポート取得・明示MACは対象外 |
+| DNS | 各負荷ステップ前に3クエリの要求・応答確認。事前クエリ分はWAN問い合わせ数から除外 | DNS forwarder試験であり、固定NAT外部UDPポートを生成しない |
+| DHCP scratch | 各試行自体がDISCOVER/OFFER/REQUEST/ACKの要求・応答確認。クライアントMACはDHCPフレームに明示済み | NAT、warm NAT、双方向負荷統計は対象外 |
+
 # Router benchmark tests
 
 This directory contains the individual benchmark implementations used by `test_basic_speed.py`.
@@ -15,6 +29,7 @@ Individual tests can also be executed directly when debugging a specific subsyst
 | File | Role |
 |---|---|
 | `target_profiles.py` | Shared hardware, PCI, driver, port, and IPv4 profile definitions. |
+| `routerbench_arp_refresh.py` | Raw Ethernet ARP/GARP sender and 60-second namespace refresh worker for scratch tests. |
 | `run_router_bench_v4_stl_throughput_pps.py` | TRex STL IPv4 NAT throughput and PPS benchmark. |
 | `run_router_bench_v4_tcp_scratch_max_sessions.py` | TCP scratch maximum concurrent session benchmark without TRex. Included in the default set and `--run-all`. |
 | `run_router_bench_v4_astf_max_sessions.py` | Legacy TRex ASTF maximum concurrent session benchmark. Launcher execution requires `--run-astf-max-sessions`. |
@@ -114,10 +129,10 @@ Performance notes:
 ```text
 The WAN DNS server and LAN DNS client run as separate processes in separate network namespaces.
 The WAN DNS server runs packet response and WAN-query counter publishing separately.
-The counter used by summary_all.csv includes only generated benchmark qnames. Unrelated router-originated DNS traffic remains in dns_server_queries.csv but does not affect cache overflow detection.
-By default, WAN-side query logs are not suppressed. Rows are accumulated in memory during the full DNS benchmark and written to dns_server_queries.csv when the WAN DNS server exits. The sidecar dns_server_queries.csv.stats.json publishes both all_queries and benchmark_queries; benchmark_queries is used for wan_queries_delta during measurement.
+The counter used by summary_all.csv includes only generated benchmark qnames and is read from dns_server_queries.csv.stats.json. Unrelated router-originated DNS traffic is counted separately and does not affect cache overflow detection.
+Successful WAN queries are never written to dns_server_queries.csv. That file contains only server-side failures with the minimal columns unix_ts, qname, and error. The default failure-row limit is 1000; additional failures remain counted in the stats sidecar as failure_log_dropped.
 By default, LAN-side measurement keeps only raw send/receive timestamps and minimal DNS status fields during each measurement step. Success rate, failure rate, timeout classification, latency percentiles, and per-query CSV rows are calculated after the timed interval ends. This avoids both per-packet disk I/O and per-packet aggregation work during the timed interval.
-Use --dns-sample-limit 0 or --dns-server-query-log-limit 0 only when intentionally disabling detailed logs. Full WAN query logging can consume significant memory at high QPS and long duration.
+Use --dns-sample-limit 0 to disable LAN sample rows or --dns-server-query-log-limit 0 to disable server-side failure rows.
 
 Delayed table pass: the second `cache_table_size` pass waits `--dns-table-reuse-interval-sec` seconds, 600 seconds by default. It is skipped unless `--dns-run-delayed-table` is specified. The launcher supplies this flag for `--run-all` and `--run-dns-all`; plain `--run-dns-latency` omits it.
 ```
@@ -490,11 +505,13 @@ Default generated names use the suffix:
 routerbench.example.net
 ```
 
-Example generated name:
+Example generated name (the middle label is unique for each benchmark run):
 
 ```text
-r000000001.routerbench.example.net
+r000000001.run20260717t120000-a1b2c3d4.routerbench.example.net
 ```
+
+Before every DNS measurement step, the script sends three queries for a step-specific preflight name. Measurement starts only when all three LAN responses contain the exact expected A record and that exact preflight qname is observed by the WAN-side test DNS server. A valid-looking response from another upstream DNS server, a DNS interception feature, or an old cache entry is recorded as `ERROR` in `summary_all.csv`. The dependent steps in that DNS item are skipped, and the script continues with the next independent DNS item. Namespace setup failure, interface failure, and WAN DNS server startup failure remain fatal because measurement cannot begin in those cases.
 
 Default DNS subtests, in execution order:
 
@@ -529,8 +546,8 @@ Main outputs:
 
 ```text
 summary_all.csv
-dns_server_queries.csv
-dns_server_queries.csv.stats.json
+dns_server_queries.csv                 server-side failures only; minimal columns
+dns_server_queries.csv.stats.json      all query counters and failure counters
 dns_<phase>_<stage>_<step>_samples.csv
 dns_<phase>_<stage>_<step>.json
 metadata.json
@@ -550,6 +567,15 @@ actual_qps
 success_rate_pct
 failure_rate_pct
 fill_rate_pct
+responses_received_total
+wrong_answer_count
+rcode_noerror_count
+rcode_servfail_count
+rcode_nxdomain_count
+rcode_refused_count
+preflight_wan_qname_seen
+preflight_expected_ip
+preflight_observed_ips
 rtt_p50_ms
 rtt_p95_ms
 rtt_p99_ms
@@ -598,15 +624,16 @@ Useful options:
 --duration
 --dns-port
 --dns-domain-suffix
+--dns-run-label       default: automatically generated unique DNS label
 --dns-answer-mode     default: random
 --dns-answer-base-ip  default: 93.184.0.1, used only with --dns-answer-mode fixed
 --dns-ttl-sec
 --dns-timeout-sec
 --dns-sample-limit        default: -1, log all per-step LAN samples after post aggregation
---dns-server-query-log-limit  default: -1, keep all WAN queries in memory and write them when the DNS server exits
+--dns-server-query-log-limit  default: 1000, maximum server-side failure rows; 0 disables rows and -1 keeps all failures
 --dns-socket-buffer-bytes
---dns-server-log-batch-size  retained for compatibility; WAN query CSV is written at server shutdown
---dns-server-log-flush-sec   stats sidecar update interval; WAN query CSV is written at server shutdown
+--dns-server-log-batch-size  retained for compatibility
+--dns-server-log-flush-sec   stats sidecar update interval; failure CSV is written at server shutdown
 --dns-server-start-delay-sec
 --dns-client-server-ip
 --dns-e6-steps
@@ -740,6 +767,16 @@ Notes:
 - The LAN NIC is moved into a dedicated namespace during the test and restored afterwards.
 
 
+
+## ARP refresh and link readiness
+
+- TRex STL/ASTF waits until every selected port reports link UP before ARP resolution or a measurement step.
+- TRex is started with `--arp-refresh-period 60`, so long-running stateful tests send gratuitous ARP every 60 seconds.
+- STL still performs ARP resolution, explicit MAC selection, NAT warm-up, NAT-port discovery, and bidirectional probes before every rate step.
+- Namespace/raw-socket tests send a directed ARP request and a gratuitous ARP request before every phase and every 60 seconds while the test remains active.
+- L4 latency, DNS, and TCP scratch tests write `arp_refresh.csv`.
+- DHCP scratch sends ARP announcements from each leased client immediately after DHCP ACK.
+
 ## NIC driver state handling
 
 TRex based tests and namespace based tests require different NIC states:
@@ -754,3 +791,8 @@ The scripts perform the needed transition automatically when profiles define bot
 `trex_interface_prepare.csv` records namespace deletion and PCI driver binding actions for TRex-based tests.
 
 `namespace_setup.csv` records namespace creation, interface movement, and IP configuration for L4/DNS tests.
+
+
+### Common test-start delay
+
+All standalone benchmark scripts wait 15 seconds after link readiness and before the first test traffic. Override with `--test-start-delay-sec`; `0` disables the wait. Helper/server/client internal roles do not wait independently.

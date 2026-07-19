@@ -47,6 +47,17 @@ except Exception:
     from target_profiles import TARGETS  # type: ignore
 
 try:
+    from tests.routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+except Exception:
+    from routerbench_test_start_delay import (  # type: ignore
+        DEFAULT_TEST_START_DELAY_SEC,
+        wait_before_test_start,
+    )
+
+try:
     from tests.run_router_bench_v4_iperf3_latency import (  # type: ignore
         DEFAULT_INTERFACE_READY_TIMEOUT_SEC,
         DEFAULT_LAN_NS,
@@ -71,6 +82,7 @@ try:
         ts_iso,
         verify_namespaces,
         wait_test_interfaces_ready,
+        make_namespace_arp_refresher,
     )
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"ERROR: failed to import shared namespace helpers from L4 latency script: {exc}")
@@ -677,6 +689,59 @@ def run_server(args):
     return 0
 
 
+
+def recv_exact(sock_obj, size):
+    chunks = bytearray()
+    while len(chunks) < int(size):
+        data = sock_obj.recv(int(size) - len(chunks))
+        if not data:
+            raise RuntimeError("connection closed during preflight response")
+        chunks.extend(data)
+    return bytes(chunks)
+
+
+def run_preflight_client(args):
+    started = time.time()
+    sock_obj = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock_obj.settimeout(float(args.connect_timeout_sec))
+    try:
+        sock_obj.bind((args.client_ip, 0))
+        sock_obj.connect((args.server_ip, int(args.server_port)))
+        payload = {
+            "direction": "UP",
+            "source_port": sock_obj.getsockname()[1],
+            "seq": 1,
+            "elapsed_sec": 0.0,
+            "preflight": True,
+        }
+        encoded, _body_len = encode_frame(payload)
+        sock_obj.sendall(encoded)
+        header = recv_exact(sock_obj, FRAME_HEADER.size)
+        body_len = FRAME_HEADER.unpack(header)[0]
+        if body_len <= 0 or body_len > MAX_FRAME_BYTES:
+            raise RuntimeError(f"invalid preflight frame length: {body_len}")
+        reply = json.loads(recv_exact(sock_obj, body_len).decode("utf-8"))
+        if reply.get("direction") != "DOWN" or int(reply.get("seq", -1)) != 1:
+            raise RuntimeError(f"invalid preflight reply: {reply}")
+        print(json.dumps({
+            "preflight_ok": 1,
+            "elapsed_sec": time.time() - started,
+            "client_ip": args.client_ip,
+            "server_ip": args.server_ip,
+            "server_port": args.server_port,
+            "reply": reply,
+        }, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        print(json.dumps({
+            "preflight_ok": 0,
+            "elapsed_sec": time.time() - started,
+            "error": str(exc),
+        }, ensure_ascii=False))
+        return 1
+    finally:
+        safe_close(sock_obj)
+
 def run_client(args):
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
@@ -1138,6 +1203,7 @@ def run_orchestrator(args):
     with ns_log_path.open("w", newline="", encoding="utf-8") as f_ns:
         ns_log = csv.writer(f_ns)
         ns_log.writerow(["ts_local", "action", "detail"])
+        arp_refresher = None
         try:
             if args.setup_namespaces and args.replace_namespaces:
                 delete_existing_namespaces(args, ns_log)
@@ -1211,6 +1277,10 @@ def run_orchestrator(args):
                 wait_test_interfaces_ready(args)
             if args.post_namespace_settle_sec > 0:
                 time.sleep(args.post_namespace_settle_sec)
+            wait_before_test_start(args.test_start_delay_sec, "TCP scratch maximum-session benchmark")
+            arp_refresher = make_namespace_arp_refresher(args, target, out_dir)
+            arp_refresher.refresh_now("startup", required=True)
+            arp_refresher.start()
 
             server_ip = args.server_ip or target["wan_ip"]
             client_ip = args.client_ip or target["lan_ip"]
@@ -1259,6 +1329,40 @@ def run_orchestrator(args):
             server_proc = subprocess.Popen(server_cmd, stdout=server_stdout, stderr=server_stderr, text=True)
             try:
                 wait_for_ready_file(ready_path, args.server_ready_timeout_sec)
+                arp_refresher.refresh_now("before_tcp_scratch_preflight", required=True)
+                preflight_stdout_path = out_dir / "tcp_scratch_preflight.json"
+                preflight_stderr_path = out_dir / "tcp_scratch_preflight.stderr.log"
+                preflight_cmd = ns_cmd(args.lan_ns, [
+                    sys.executable, str(Path(__file__).resolve()),
+                    "--internal-role", "preflight",
+                    "--client-ip", str(client_ip),
+                    "--server-ip", str(server_ip),
+                    "--server-port", str(args.server_port),
+                    "--connect-timeout-sec", str(args.connect_timeout_sec),
+                ])
+                with preflight_stdout_path.open("w", encoding="utf-8") as pf_out, preflight_stderr_path.open("w", encoding="utf-8") as pf_err:
+                    preflight_proc = subprocess.run(
+                        preflight_cmd, stdout=pf_out, stderr=pf_err, text=True,
+                        timeout=float(args.connect_timeout_sec) + 5.0,
+                    )
+                if preflight_proc.returncode != 0:
+                    raise RuntimeError(
+                        f"TCP scratch round-trip preflight failed; see {preflight_stdout_path} and {preflight_stderr_path}"
+                    )
+
+                # The preflight connection must not be included in the measured server counters.
+                # Restart the server and clear its output files before launching the real client.
+                terminate_process(server_proc)
+                server_stdout.close()
+                server_stderr.close()
+                ready_path.unlink(missing_ok=True)
+                client_status_path.unlink(missing_ok=True)
+                server_stdout = server_stdout_path.open("w", encoding="utf-8")
+                server_stderr = server_stderr_path.open("w", encoding="utf-8")
+                server_proc = subprocess.Popen(server_cmd, stdout=server_stdout, stderr=server_stderr, text=True)
+                wait_for_ready_file(ready_path, args.server_ready_timeout_sec)
+
+                arp_refresher.refresh_now("before_tcp_scratch_client", required=True)
                 print("[RUN] LAN TCP client")
                 print(" ".join(client_cmd))
                 with client_stdout_path.open("w", encoding="utf-8") as client_stdout, client_stderr_path.open("w", encoding="utf-8") as client_stderr:
@@ -1351,6 +1455,8 @@ def run_orchestrator(args):
             print("============================================================")
             return 0
         finally:
+            if arp_refresher is not None:
+                arp_refresher.stop()
             if args.restore_dpdk_after and prepare_trex_interfaces_from_profile is not None:
                 try:
                     prepare_trex_interfaces_from_profile(target, getattr(args, "dpdk_driver", "") or None, ns_log)
@@ -1361,7 +1467,7 @@ def run_orchestrator(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Run IPv4 TCP scratch maximum session benchmark without TRex.", allow_abbrev=False)
-    parser.add_argument("--internal-role", choices=["orchestrator", "server", "client"], default="orchestrator", help=argparse.SUPPRESS)
+    parser.add_argument("--internal-role", choices=["orchestrator", "server", "client", "preflight"], default="orchestrator", help=argparse.SUPPRESS)
 
     parser.add_argument("--target", choices=TARGETS.keys(), default="i226_1g")
     parser.add_argument("--out-dir", default="", help="Result directory. Default: /var/trex/trex_tcp_scratch_max_sessions_<target>_<timestamp>/. ")
@@ -1401,6 +1507,7 @@ def build_parser():
     parser.add_argument("--no-restore-dpdk-after", dest="restore_dpdk_after", action="store_false")
     parser.add_argument("--dpdk-driver", default="")
     parser.add_argument("--post-namespace-settle-sec", type=parse_non_negative_float, default=DEFAULT_POST_NAMESPACE_SETTLE_SEC)
+    parser.add_argument("--test-start-delay-sec", type=parse_non_negative_float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after namespace interfaces report link-up and before testing. Default: 15.")
     parser.add_argument("--wait-interfaces-ready", dest="wait_interfaces_ready", action="store_true", default=True)
     parser.add_argument("--no-wait-interfaces-ready", dest="wait_interfaces_ready", action="store_false")
     parser.add_argument("--interface-ready-timeout-sec", type=parse_positive_float, default=DEFAULT_INTERFACE_READY_TIMEOUT_SEC)
@@ -1437,6 +1544,10 @@ def main():
         if not args.client_ip or not args.server_ip:
             raise SystemExit("ERROR: internal client requires --client-ip and --server-ip")
         return run_client(args)
+    if args.internal_role == "preflight":
+        if not args.client_ip or not args.server_ip:
+            raise SystemExit("ERROR: internal preflight requires --client-ip and --server-ip")
+        return run_preflight_client(args)
     return run_orchestrator(args)
 
 

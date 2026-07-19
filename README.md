@@ -1,3 +1,17 @@
+## 通信事前確認の適用範囲
+
+各項目は、試験方式に適用できる場合だけ実装する。
+
+| 試験 | 適用する確認 | 適用しない項目と理由 |
+|---|---|---|
+| STL throughput/PPS | ステップごとのARP、明示MAC、NAT外部UDPポート取得、warm NAT成功判定、上り・下り32パケット確認、方向別統計 | なし |
+| ASTF max sessions / CPS | 各測定前の小規模TCP往復事前試験。接続成功と両方向L7バイトを確認 | NAT外部ポートと明示MACはASTF/TRexが動的に管理するため対象外 |
+| ASTF NAT stability | 各サイクル前に同一プロトコル・同一payload directionの小規模往復事前試験 | NAT外部ポートと明示MACはASTF/TRexが動的に管理するため対象外 |
+| TCP scratch max sessions | 本測定前に単一TCP接続でUP要求とDOWN応答を確認 | カーネルTCP/IPがNATポートとEthernetヘッダーを管理するため外部ポート取得・明示MACは対象外 |
+| L4 latency | 各フェーズ前の既存TCP/UDP request-response preflight | カーネルソケット試験のため外部ポート取得・明示MACは対象外 |
+| DNS | 各負荷ステップ前に3クエリの要求・応答確認。事前クエリ分はWAN問い合わせ数から除外 | DNS forwarder試験であり、固定NAT外部UDPポートを生成しない |
+| DHCP scratch | 各試行自体がDISCOVER/OFFER/REQUEST/ACKの要求・応答確認。クライアントMACはDHCPフレームに明示済み | NAT、warm NAT、双方向負荷統計は対象外 |
+
 # Launcher test selection
 
 `test_basic_speed.py` uses one selection rule set:
@@ -129,6 +143,11 @@ sudo python3 test_basic_speed.py \
 ```
 
 `--soak-duration-sec` is valid only when ASTF NAT stability is selected with `--run-astf-natstability` or `--run-all`.
+
+
+## ARP refresh policy
+
+TRex-based tests wait for link-up before ARP resolution and start TRex with `--arp-refresh-period 60`. Namespace and scratch-socket tests send directed ARP plus gratuitous ARP before each phase and every 60 seconds during long-running tests. L4 latency, DNS, and TCP scratch results include `arp_refresh.csv`; DHCP scratch records per-lease ARP announcements in its event CSV.
 
 ## TRex/L4 NIC state transition
 
@@ -315,3 +334,12 @@ This test is part of the no-option default set. The result can still depend on t
 
 
 DNS note: the DNS benchmark returns deterministic random public-looking A records by default. This avoids common DNS rebinding protection that drops private-address DNS answers. Use `--dns-answer-mode fixed --dns-answer-base-ip 93.184.0.1` if a fixed answer address is needed.
+
+### DNS response validation
+
+The DNS benchmark validates the returned A record against the deterministic expected address for each qname. It reports wrong answers and RCODE categories separately. Each run uses a unique qname label, and every step requires its unique preflight qname to appear at the WAN-side test DNS server before measurement proceeds.
+
+
+## Link-up settling delay
+
+Every benchmark now waits 15 seconds after its test interfaces report link-up and before it sends benchmark traffic. The launcher and every standalone test accept `--test-start-delay-sec`; use `0` only when the DUT does not require a settling period.
