@@ -34,60 +34,82 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    from tests.target_profiles import TARGETS  # type: ignore
+    from tests.lib.config import TARGETS  # type: ignore
 except Exception:
-    from target_profiles import TARGETS  # type: ignore
+    from lib.config import TARGETS  # type: ignore
 
 try:
-    from tests.routerbench_test_start_delay import (  # type: ignore
+    from tests.lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 except Exception:
-    from routerbench_test_start_delay import (  # type: ignore
+    from lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 
 try:
-    from tests.run_router_bench_v4_stl_throughput_pps import (  # type: ignore
+    from tests.lib.common import (  # type: ignore
         DEFAULT_RESULT_ROOT,
-        parse_interfaces,
-        prepare_trex_interfaces_from_profile,
-        require_root,
         ts_compact,
     )
-except Exception:
-    from run_router_bench_v4_stl_throughput_pps import (  # type: ignore
-        DEFAULT_RESULT_ROOT,
-        parse_interfaces,
-        prepare_trex_interfaces_from_profile,
-        require_root,
-        ts_compact,
+    from tests.lib.config import load_defaults as _load_defaults  # type: ignore
+    from tests.lib.output import prepare_details_dir  # type: ignore
+    from tests.lib.preflight import (  # type: ignore
+        add_consecutive_preflight_arguments,
+        run_consecutive_preflight,
+        validate_consecutive_preflight_arguments,
     )
-
-try:
-    from tests.run_router_bench_v4_iperf3_latency import (  # type: ignore
+    from tests.lib.repeat import (
+        DEFAULT_REPEAT,
+        argparse_repeat,
+        run_repeated_subprocesses,
+    )  # type: ignore
+    from tests.lib.trex import parse_interfaces, prepare_trex_interfaces_from_profile  # type: ignore
+    from tests.lib.network import (  # type: ignore
         CommandError,
         delete_namespace_if_exists,
         namespace_exists,
         prepare_kernel_interfaces_from_profile,
+        require_root,
         resolve_profile_interfaces,
         root_iface_exists,
         run_cmd,
         wait_namespace_interface_ready,
     )
 except Exception:
-    from run_router_bench_v4_iperf3_latency import (  # type: ignore
+    from lib.common import (  # type: ignore
+        DEFAULT_RESULT_ROOT,
+        ts_compact,
+    )
+    from lib.config import load_defaults as _load_defaults  # type: ignore
+    from lib.output import prepare_details_dir  # type: ignore
+    from lib.preflight import (  # type: ignore
+        add_consecutive_preflight_arguments,
+        run_consecutive_preflight,
+        validate_consecutive_preflight_arguments,
+    )
+    from lib.repeat import (
+        DEFAULT_REPEAT,
+        argparse_repeat,
+        run_repeated_subprocesses,
+    )  # type: ignore
+    from lib.trex import parse_interfaces, prepare_trex_interfaces_from_profile  # type: ignore
+    from lib.network import (  # type: ignore
         CommandError,
         delete_namespace_if_exists,
         namespace_exists,
         prepare_kernel_interfaces_from_profile,
+        require_root,
         resolve_profile_interfaces,
         root_iface_exists,
         run_cmd,
         wait_namespace_interface_ready,
     )
+
+
+_DHCP_DEFAULTS = _load_defaults("dhcp")
 
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
@@ -619,7 +641,7 @@ def setup_dhcp_namespace(args, target, log_writer):
     resolve_profile_interfaces(args, target, log_writer)
 
     if not args.lan_iface:
-        raise SystemExit("ERROR: DHCP scratch test could not resolve LAN interface. Set lan_iface in tests/target_profiles.py or pass --lan-iface.")
+        raise SystemExit("ERROR: DHCP scratch test could not resolve LAN interface. Set lan_iface in tests/config/target_profiles.json or pass --lan-iface.")
     if not root_iface_exists(args.lan_iface):
         raise SystemExit(f"ERROR: LAN interface is not visible in the root namespace: {args.lan_iface}")
 
@@ -724,6 +746,47 @@ def run_helper_trial(args, phase, trial, clients, mac_base):
     return trial_row, client_rows, events
 
 
+def run_dhcp_preflight(args, details_dir, phase, trial):
+    """Require three consecutive DHCP DORA successes before a measured trial."""
+
+    preflight_args = argparse.Namespace(**vars(args))
+    preflight_args.dhcp_release_at_end = True
+    phase_offsets = {
+        "single_client_latency": 100000,
+        "burst_clients_latency": 200000,
+        "reconnect": 300000,
+    }
+    phase_offset = phase_offsets[phase]
+
+    def probe(attempt):
+        mac_base = trial_mac_base(
+            args.dhcp_client_mac_base,
+            phase_offset + int(trial) * 100 + int(attempt),
+        )
+        trial_row, _client_rows, _events = run_helper_trial(
+            preflight_args,
+            phase=f"preflight_{phase}_attempt{attempt}",
+            trial=trial,
+            clients=1,
+            mac_base=mac_base,
+        )
+        if int(trial_row.get("all_bound") or 0) != 1:
+            raise RuntimeError(
+                f"DHCP DORA failed: bound={trial_row.get('clients_bound')}/"
+                f"{trial_row.get('clients_requested')}"
+            )
+        return trial_row
+
+    return run_consecutive_preflight(
+        probe,
+        phase=f"dhcp_{phase}_trial_{trial}",
+        csv_path=Path(details_dir) / "dhcp_preflight_recovery.csv",
+        required_successes=args.preflight_success_consecutive,
+        interval_sec=args.preflight_probe_interval_sec,
+        timeout_sec=args.preflight_timeout_sec,
+    )
+
+
 def run_reconnect_trial(args, pair_index, mac_base):
     initial_trial, initial_clients, initial_events = run_helper_trial(
         args,
@@ -816,16 +879,17 @@ def run(args):
     require_root()
     out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"dhcp_scratch_{args.target}_{ts_compact()}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    details_dir = prepare_details_dir(out_dir)
 
     target = merge_target_with_overrides(TARGETS[args.target], args)
-    write_metadata(out_dir, args.target, target, args)
+    write_metadata(details_dir, args.target, target, args)
 
     events = []
     client_rows = []
     trial_rows = []
     reconnect_rows = []
     start_time = time.time()
-    ns_log_path = out_dir / "namespace_setup.csv"
+    ns_log_path = details_dir / "namespace_setup.csv"
     with ns_log_path.open("w", newline="", encoding="utf-8") as f:
         ns_log = csv.writer(f)
         ns_log.writerow(["ts_local", "action", "detail"])
@@ -837,6 +901,7 @@ def run(args):
         print("Tools           : Python AF_PACKET raw socket DHCPv4 client, ip(iproute2 namespaces)")
         print(f"LAN namespace   : {args.dhcp_ns}")
         print(f"LAN profile iface: {target.get('lan_iface', '(not defined)')}")
+        print(f"Repeat          : {args.repeat}")
         print(f"Single repeats  : {args.dhcp_single_repeats}")
         print(f"Burst           : clients={args.dhcp_burst_clients} repeats={args.dhcp_burst_repeats}")
         print(f"Reconnect       : repeats={args.dhcp_reconnect_repeats} wait={args.dhcp_reconnect_wait_sec}s")
@@ -852,6 +917,9 @@ def run(args):
                 trial_no += 1
                 mac_base = trial_mac_base(args.dhcp_client_mac_base, trial_no)
                 print(f"--- DHCP single_client_latency trial={rep + 1} clients=1 ---", flush=True)
+                run_dhcp_preflight(
+                    args, details_dir, "single_client_latency", rep + 1
+                )
                 trial_row, rows, evs = run_helper_trial(args, "single_client_latency", rep + 1, 1, mac_base)
                 trial_rows.append(trial_row)
                 client_rows.extend(rows)
@@ -863,6 +931,9 @@ def run(args):
                 trial_no += 1
                 mac_base = trial_mac_base(args.dhcp_client_mac_base, trial_no)
                 print(f"--- DHCP burst_clients_latency trial={rep + 1} clients={args.dhcp_burst_clients} ---", flush=True)
+                run_dhcp_preflight(
+                    args, details_dir, "burst_clients_latency", rep + 1
+                )
                 trial_row, rows, evs = run_helper_trial(args, "burst_clients_latency", rep + 1, int(args.dhcp_burst_clients), mac_base)
                 trial_rows.append(trial_row)
                 client_rows.extend(rows)
@@ -874,6 +945,7 @@ def run(args):
                 trial_no += 1
                 mac_base = trial_mac_base(args.dhcp_client_mac_base, trial_no)
                 print(f"--- DHCP reconnect trial={rep + 1} wait={args.dhcp_reconnect_wait_sec}s ---", flush=True)
+                run_dhcp_preflight(args, details_dir, "reconnect", rep + 1)
                 reconnect_row, pair_trials, rows, evs = run_reconnect_trial(args, rep + 1, mac_base)
                 reconnect_rows.append(reconnect_row)
                 trial_rows.extend(pair_trials)
@@ -882,31 +954,38 @@ def run(args):
                 print(f"reconnect trial={rep + 1}: initial={reconnect_row['initial_success']} reconnect={reconnect_row['reconnect_success']}", flush=True)
                 time.sleep(float(args.dhcp_between_trials_sec))
         finally:
-            cleanup_dhcp_namespace(args, target, out_dir, ns_log)
+            cleanup_dhcp_namespace(args, target, details_dir, ns_log)
 
     elapsed = time.time() - start_time
     summary_rows = summarize_trials(args, trial_rows, elapsed)
     # New scratch names.
-    write_csv(out_dir / "dhcp_scratch_trials.csv", trial_rows)
-    write_csv(out_dir / "dhcp_scratch_reconnect.csv", reconnect_rows)
-    write_csv(out_dir / "dhcp_scratch_clients.csv", client_rows)
-    write_csv(out_dir / "dhcp_scratch_events.csv", events)
+    write_csv(details_dir / "dhcp_scratch_trials.csv", trial_rows)
+    write_csv(details_dir / "dhcp_scratch_reconnect.csv", reconnect_rows)
+    write_csv(details_dir / "dhcp_scratch_clients.csv", client_rows)
+    write_csv(details_dir / "dhcp_scratch_events.csv", events)
     # Legacy filenames kept so existing post-processing does not break.
-    write_csv(out_dir / "dhcp_emu_trials.csv", trial_rows)
-    write_csv(out_dir / "dhcp_emu_reconnect.csv", reconnect_rows)
-    write_csv(out_dir / "dhcp_emu_clients.csv", client_rows)
-    write_csv(out_dir / "dhcp_emu_events.csv", events)
+    write_csv(details_dir / "dhcp_emu_trials.csv", trial_rows)
+    write_csv(details_dir / "dhcp_emu_reconnect.csv", reconnect_rows)
+    write_csv(details_dir / "dhcp_emu_clients.csv", client_rows)
+    write_csv(details_dir / "dhcp_emu_events.csv", events)
     write_csv(out_dir / "summary_all.csv", summary_rows)
     print("=== DHCP scratch summary ===")
     for row in summary_rows:
         print(json.dumps(row, ensure_ascii=False, default=str))
     print(f"Results: {out_dir}")
+    print(f"Details: {details_dir}")
 
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Scratch raw-socket DHCPv4 lease acquisition benchmark", allow_abbrev=False)
-    parser.add_argument("--target", choices=TARGETS.keys(), default="i226_2p5g")
+    parser.add_argument("--target", choices=TARGETS.keys(), default=_DHCP_DEFAULTS["target"])
     parser.add_argument("--out-dir", default="")
+    parser.add_argument(
+        "--repeat",
+        type=argparse_repeat,
+        default=DEFAULT_REPEAT,
+        help="Repeat the complete DHCP benchmark. Default: 1.",
+    )
     parser.add_argument("--interfaces", type=parse_interfaces, default=None)
     parser.add_argument("--lan-ip", default="")
     parser.add_argument("--lan-gw", default="")
@@ -917,41 +996,42 @@ def build_arg_parser():
     parser.add_argument("--cores", type=int, default=None)
     parser.add_argument("--lan-iface", default="", help="Linux interface connected to DUT LAN. Default: target profile lan_iface.")
     parser.add_argument("--wan-iface", default="", help="Linux interface connected to DUT WAN. Only used to keep shared profile interface resolver compatible; DHCP traffic uses LAN only.")
-    parser.add_argument("--dhcp-ns", default="rb_dhcp", help="Network namespace used for scratch DHCP client.")
-    parser.add_argument("--interface-ready-timeout-sec", type=float, default=10.0)
-    parser.add_argument("--post-namespace-settle-sec", type=float, default=2.0)
+    parser.add_argument("--dhcp-ns", default=_DHCP_DEFAULTS["namespace"], help="Network namespace used for scratch DHCP client.")
+    parser.add_argument("--interface-ready-timeout-sec", type=float, default=_DHCP_DEFAULTS["interface_ready_timeout_sec"])
+    parser.add_argument("--post-namespace-settle-sec", type=float, default=_DHCP_DEFAULTS["post_namespace_settle_sec"])
     parser.add_argument("--test-start-delay-sec", type=float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after the DHCP namespace interface reports link-up and before testing. Default: 15.")
     parser.add_argument("--no-auto-kernel-bind", action="store_true", help="Do not bind profile PCI devices back to kernel drivers before DHCP.")
-    parser.add_argument("--restore-dpdk-after", dest="restore_dpdk_after", action="store_true", default=True)
+    parser.add_argument("--restore-dpdk-after", dest="restore_dpdk_after", action="store_true", default=_DHCP_DEFAULTS["restore_dpdk_after"])
     parser.add_argument("--no-restore-dpdk-after", dest="restore_dpdk_after", action="store_false")
-    parser.add_argument("--dpdk-driver", default="auto")
+    parser.add_argument("--dpdk-driver", default=_DHCP_DEFAULTS["dpdk_driver"])
 
     parser.add_argument("--dhcp-clients", type=int, default=None, help="Compatibility alias. Use --dhcp-burst-clients.")
-    parser.add_argument("--dhcp-client-mac-base", default="02:00:00:70:00:01")
-    parser.add_argument("--dhcp-vlan", type=int, default=-1, help="-1 means untagged.")
-    parser.add_argument("--dhcp-qinq", type=int, default=-1, help="-1 means no second VLAN tag.")
-    parser.add_argument("--dhcp-hostname-prefix", default="rb-dhcp-")
-    parser.add_argument("--dhcp-single-repeats", type=int, default=3, help="Number of 1-client latency trials.")
-    parser.add_argument("--dhcp-burst-clients", type=int, default=10, help="Number of simultaneous clients in the burst trial.")
-    parser.add_argument("--dhcp-burst-repeats", type=int, default=1, help="Number of burst trials.")
-    parser.add_argument("--dhcp-reconnect-repeats", type=int, default=1, help="Number of same-MAC reconnect trials.")
-    parser.add_argument("--dhcp-reconnect-wait-sec", type=float, default=60.0, help="Wait time between release and same-MAC reconnect.")
-    parser.add_argument("--dhcp-timeout-sec", type=float, default=30.0, help="Maximum wait time per trial.")
-    parser.add_argument("--dhcp-poll-interval-sec", type=float, default=0.2, help="Socket receive timeout while waiting for DORA packets.")
-    parser.add_argument("--dhcp-between-trials-sec", type=float, default=1.0, help="Pause between trials.")
-    parser.add_argument("--dhcp-release-at-end", dest="dhcp_release_at_end", action="store_true", default=True, help="Send DHCP RELEASE for ACKed clients at the end of each helper trial.")
+    parser.add_argument("--dhcp-client-mac-base", default=_DHCP_DEFAULTS["client_mac_base"])
+    parser.add_argument("--dhcp-vlan", type=int, default=_DHCP_DEFAULTS["vlan"], help="-1 means untagged.")
+    parser.add_argument("--dhcp-qinq", type=int, default=_DHCP_DEFAULTS["qinq"], help="-1 means no second VLAN tag.")
+    parser.add_argument("--dhcp-hostname-prefix", default=_DHCP_DEFAULTS["hostname_prefix"])
+    parser.add_argument("--dhcp-single-repeats", type=int, default=_DHCP_DEFAULTS["single_repeats"], help="Number of 1-client latency trials.")
+    parser.add_argument("--dhcp-burst-clients", type=int, default=_DHCP_DEFAULTS["burst_clients"], help="Number of simultaneous clients in the burst trial.")
+    parser.add_argument("--dhcp-burst-repeats", type=int, default=_DHCP_DEFAULTS["burst_repeats"], help="Number of burst trials.")
+    parser.add_argument("--dhcp-reconnect-repeats", type=int, default=_DHCP_DEFAULTS["reconnect_repeats"], help="Number of same-MAC reconnect trials.")
+    parser.add_argument("--dhcp-reconnect-wait-sec", type=float, default=_DHCP_DEFAULTS["reconnect_wait_sec"], help="Wait time between release and same-MAC reconnect.")
+    parser.add_argument("--dhcp-timeout-sec", type=float, default=_DHCP_DEFAULTS["timeout_sec"], help="Maximum wait time per trial.")
+    parser.add_argument("--dhcp-poll-interval-sec", type=float, default=_DHCP_DEFAULTS["poll_interval_sec"], help="Socket receive timeout while waiting for DORA packets.")
+    parser.add_argument("--dhcp-between-trials-sec", type=float, default=_DHCP_DEFAULTS["between_trials_sec"], help="Pause between trials.")
+    parser.add_argument("--dhcp-release-at-end", dest="dhcp_release_at_end", action="store_true", default=_DHCP_DEFAULTS["release_at_end"], help="Send DHCP RELEASE for ACKed clients at the end of each helper trial.")
     parser.add_argument("--no-dhcp-release-at-end", dest="dhcp_release_at_end", action="store_false")
+    add_consecutive_preflight_arguments(parser)
 
     # Internal helper mode.  Kept visible in --help only as suppressed options.
     parser.add_argument("--_dhcp-helper", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--helper-iface", default="", help=argparse.SUPPRESS)
     parser.add_argument("--helper-clients", type=int, default=1, help=argparse.SUPPRESS)
-    parser.add_argument("--helper-mac-base", default="02:00:00:70:00:01", help=argparse.SUPPRESS)
-    parser.add_argument("--helper-timeout-sec", type=float, default=30.0, help=argparse.SUPPRESS)
-    parser.add_argument("--helper-poll-interval-sec", type=float, default=0.2, help=argparse.SUPPRESS)
-    parser.add_argument("--helper-hostname-prefix", default="rb-dhcp-", help=argparse.SUPPRESS)
-    parser.add_argument("--helper-vlan", type=int, default=-1, help=argparse.SUPPRESS)
-    parser.add_argument("--helper-qinq", type=int, default=-1, help=argparse.SUPPRESS)
+    parser.add_argument("--helper-mac-base", default=_DHCP_DEFAULTS["client_mac_base"], help=argparse.SUPPRESS)
+    parser.add_argument("--helper-timeout-sec", type=float, default=_DHCP_DEFAULTS["timeout_sec"], help=argparse.SUPPRESS)
+    parser.add_argument("--helper-poll-interval-sec", type=float, default=_DHCP_DEFAULTS["poll_interval_sec"], help=argparse.SUPPRESS)
+    parser.add_argument("--helper-hostname-prefix", default=_DHCP_DEFAULTS["hostname_prefix"], help=argparse.SUPPRESS)
+    parser.add_argument("--helper-vlan", type=int, default=_DHCP_DEFAULTS["vlan"], help=argparse.SUPPRESS)
+    parser.add_argument("--helper-qinq", type=int, default=_DHCP_DEFAULTS["qinq"], help=argparse.SUPPRESS)
     parser.add_argument("--helper-no-release", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -981,6 +1061,7 @@ def validate_args(args):
         raise SystemExit("ERROR: --interface-ready-timeout-sec must be positive")
     if args.post_namespace_settle_sec < 0:
         raise SystemExit("ERROR: --post-namespace-settle-sec must be >= 0")
+    validate_consecutive_preflight_arguments(args)
 
 
 def main():
@@ -990,6 +1071,22 @@ def main():
         helper_main(args)
         return
     validate_args(args)
+    repeat_out_dir = (
+        Path(args.out_dir)
+        if args.out_dir
+        else DEFAULT_RESULT_ROOT / f"dhcp_scratch_{args.target}_{ts_compact()}"
+    )
+    repeated_rc = run_repeated_subprocesses(
+        args.repeat,
+        repeat_out_dir,
+        summary_filenames=("summary_all.csv",),
+        script_path=sys.argv[0],
+        cwd=REPO_DIR,
+    )
+    if repeated_rc is not None:
+        if repeated_rc != 0:
+            raise SystemExit(repeated_rc)
+        return
     try:
         run(args)
     except KeyboardInterrupt:

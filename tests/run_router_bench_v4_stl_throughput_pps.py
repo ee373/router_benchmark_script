@@ -25,7 +25,6 @@ Single fixed-load run:
 
 import argparse
 import csv
-import datetime as dt
 import json
 import os
 import signal
@@ -37,17 +36,6 @@ import traceback
 import zlib
 from pathlib import Path
 
-TREX_DIR = "/opt/trex/v3.08"
-TREX_CFG_PATH = "/etc/trex_cfg.yaml"
-
-FRAME_64 = 64
-FRAME_LARGE = 1414
-L1_OVERHEAD_BYTES = 20
-UDP_PORT = 7770
-RAW_INTERVAL_SEC = 1.0
-DEFAULT_RATE_MBPS_STEPS = (100, 150, 220, 330, 470, 680, 1000, 1500, 2200, 3300, 4700, 6800, 10000)
-DEFAULT_RESULT_ROOT = Path(os.environ.get("TREX_RESULT_ROOT", "/var/trex"))
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 if str(REPO_DIR) not in sys.path:
@@ -56,46 +44,154 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    from tests.target_profiles import TARGETS  # type: ignore
+    from tests.lib.config import TARGETS, target_for_ip_version  # type: ignore
+    from tests.lib.output import prepare_details_dir  # type: ignore
+    from tests.lib.rate_steps import (  # type: ignore
+        format_kpps_steps,
+        high_loss_streak_update,
+        limit_positive_steps,
+        make_e12_steps,
+    )
+    from tests.lib.source_ports import (  # type: ignore
+        add_lan_source_port_range_argument,
+        first_lan_source_port,
+        format_lan_source_port_range,
+    )
 except Exception:
-    from target_profiles import TARGETS  # type: ignore
+    from lib.config import TARGETS, target_for_ip_version  # type: ignore
+    from lib.output import prepare_details_dir  # type: ignore
+    from lib.rate_steps import format_kpps_steps, high_loss_streak_update, limit_positive_steps, make_e12_steps  # type: ignore
+    from lib.source_ports import add_lan_source_port_range_argument, first_lan_source_port, format_lan_source_port_range  # type: ignore
 
 try:
-    from tests.routerbench_test_start_delay import (  # type: ignore
+    from tests.lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 except Exception:
-    from routerbench_test_start_delay import (  # type: ignore
+    from lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 
+try:
+    from tests.lib.common import (  # type: ignore
+        DEFAULT_RESULT_ROOT,
+        flatten,
+        json_cell,
+        ts_compact,
+        ts_iso,
+        write_raw_stats as _write_raw_stats,
+        write_summary_csv,
+    )
+    from tests.lib.config import load_defaults as _load_defaults  # type: ignore
+except Exception:
+    from lib.common import (  # type: ignore
+        DEFAULT_RESULT_ROOT,
+        flatten,
+        json_cell,
+        ts_compact,
+        ts_iso,
+        write_raw_stats as _write_raw_stats,
+        write_summary_csv,
+    )
+    from lib.config import load_defaults as _load_defaults  # type: ignore
 
-def ts_compact():
-    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+try:
+    from tests.lib.trex import (  # type: ignore
+        TREX_CFG_PATH,
+        TREX_DIR,
+        RAW_INTERVAL_SEC,
+        DEFAULT_BENCHMARK_NAMESPACES,
+        _trex_link_up_from_attr,
+        add_trex_api_path,
+        available_dpdk_driver_candidates,
+        bind_pci_to_driver,
+        bind_pci_to_driver_once,
+        cleanup_benchmark_namespaces,
+        delete_netns_force,
+        dpdk_driver_bind_path_exists,
+        install_trex_cfg,
+        kill_existing_trex,
+        merge_target_with_overrides,
+        namespace_exists,
+        normalize_pci_bdf,
+        parse_interfaces,
+        pci_current_driver,
+        pci_device_path,
+        pci_unbind_current_driver,
+        pci_vendor_device_ids,
+        prepare_trex_interfaces_from_profile,
+        profile_dpdk_driver_entry,
+        profile_pci_interface_entry,
+        profile_port_index,
+        render_trex_cfg,
+        resolve_ipv6_gateway_macs,
+        require_root,
+        run_cmd_noexcept,
+        sysfs_write,
+        tail_text,
+        try_modprobe_driver,
+        wait_rpc,
+        wait_trex_ports_link_up,
+    )
+except Exception:
+    from lib.trex import (  # type: ignore
+        TREX_CFG_PATH,
+        TREX_DIR,
+        RAW_INTERVAL_SEC,
+        DEFAULT_BENCHMARK_NAMESPACES,
+        _trex_link_up_from_attr,
+        add_trex_api_path,
+        available_dpdk_driver_candidates,
+        bind_pci_to_driver,
+        bind_pci_to_driver_once,
+        cleanup_benchmark_namespaces,
+        delete_netns_force,
+        dpdk_driver_bind_path_exists,
+        install_trex_cfg,
+        kill_existing_trex,
+        merge_target_with_overrides,
+        namespace_exists,
+        normalize_pci_bdf,
+        parse_interfaces,
+        pci_current_driver,
+        pci_device_path,
+        pci_unbind_current_driver,
+        pci_vendor_device_ids,
+        prepare_trex_interfaces_from_profile,
+        profile_dpdk_driver_entry,
+        profile_pci_interface_entry,
+        profile_port_index,
+        render_trex_cfg,
+        resolve_ipv6_gateway_macs,
+        require_root,
+        run_cmd_noexcept,
+        sysfs_write,
+        tail_text,
+        try_modprobe_driver,
+        wait_rpc,
+        wait_trex_ports_link_up,
+    )
 
 
-def ts_iso():
-    return dt.datetime.now().isoformat(timespec="seconds")
+_STL_DEFAULTS = _load_defaults("stl")
+FRAME_64 = int(_STL_DEFAULTS["frame_64_bytes"])
+FRAME_LARGE = int(_STL_DEFAULTS["frame_large_bytes"])
+L1_OVERHEAD_BYTES = int(_STL_DEFAULTS["l1_overhead_bytes"])
+UDP_PORT = int(_STL_DEFAULTS["udp_port"])
+DEFAULT_THROUGHPUT_START_MBPS = float(_STL_DEFAULTS["throughput_start_mbps"])
+DEFAULT_PPS_START = float(_STL_DEFAULTS["pps_start"])
+DEFAULT_HIGH_LOSS_THRESHOLD = float(_STL_DEFAULTS["high_loss_threshold"])
+DEFAULT_HIGH_LOSS_CONSECUTIVE = int(_STL_DEFAULTS["high_loss_consecutive"])
+DEFAULT_RECOVERY_PROBE_INTERVAL_SEC = float(_STL_DEFAULTS["recovery_probe_interval_sec"])
+DEFAULT_RECOVERY_SUCCESS_CONSECUTIVE = int(_STL_DEFAULTS["recovery_success_consecutive"])
+DEFAULT_RECOVERY_TIMEOUT_SEC = float(_STL_DEFAULTS["recovery_timeout_sec"])
 
 
-def require_root():
-    if os.geteuid() != 0:
-        raise SystemExit("ERROR: run with sudo. This script starts TRex and writes /etc/trex_cfg.yaml.")
-
-
-def add_trex_api_path():
-    api_path = os.path.join(TREX_DIR, "automation", "trex_control_plane", "interactive")
-    if api_path not in sys.path:
-        sys.path.insert(0, api_path)
-
-
-def parse_interfaces(value):
-    parts = [x.strip() for x in value.split(",") if x.strip()]
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError("--interfaces must be two PCI addresses, e.g. 05:00.0,04:00.0")
-    return parts
+def write_raw_stats(writer, phase, test_name, elapsed, stats):
+    return _write_raw_stats(writer, phase, test_name, elapsed, stats)
 
 
 def parse_rate_steps(value):
@@ -124,6 +220,20 @@ def parse_rate_mbps_steps(value):
     return steps
 
 
+def parse_pps_steps(value):
+    try:
+        steps = [float(x.strip().replace("_", "")) for x in value.split(",") if x.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--pps-steps must be comma-separated numbers, e.g. 1000,1200,1500"
+        ) from exc
+    if not steps:
+        raise argparse.ArgumentTypeError("--pps-steps must not be empty")
+    if any(step <= 0 for step in steps):
+        raise argparse.ArgumentTypeError("--pps-steps values must be positive")
+    return steps
+
+
 def fmt_rate_value(value):
     value = float(value)
     if value.is_integer():
@@ -133,20 +243,22 @@ def fmt_rate_value(value):
 
 def make_default_rate_mbps_steps(line_rate_gbps):
     line_rate_mbps = float(line_rate_gbps) * 1000.0
-    steps = [float(x) for x in DEFAULT_RATE_MBPS_STEPS if float(x) <= line_rate_mbps + 1e-9]
-    if line_rate_mbps > 0 and (not steps or abs(steps[-1] - line_rate_mbps) > 1e-9):
-        steps.append(line_rate_mbps)
-    return steps
+    return make_e12_steps(DEFAULT_THROUGHPUT_START_MBPS, line_rate_mbps)
 
 
 def limit_rate_mbps_steps(steps, line_rate_gbps):
     line_rate_mbps = float(line_rate_gbps) * 1000.0
-    limited = sorted(set(float(x) for x in steps if float(x) <= line_rate_mbps + 1e-9))
-    if not limited:
-        raise SystemExit(
-            f"ERROR: no Mbps rate steps are <= configured line rate ({fmt_rate_value(line_rate_mbps)} Mbps)"
-        )
-    return limited
+    return limit_positive_steps(steps, line_rate_mbps, "Mbps rate")
+
+
+def make_default_pps_steps(line_rate_gbps, frame_size=FRAME_64):
+    maximum = theoretical_pps_per_port(line_rate_gbps, frame_size)
+    return make_e12_steps(DEFAULT_PPS_START, maximum)
+
+
+def limit_pps_steps(steps, line_rate_gbps, frame_size=FRAME_64):
+    maximum = theoretical_pps_per_port(line_rate_gbps, frame_size)
+    return limit_positive_steps(steps, maximum, "PPS rate")
 
 
 def build_rate_points(line_rate_gbps, rate_steps=None, rate_mbps_steps=None):
@@ -174,576 +286,23 @@ def build_rate_points(line_rate_gbps, rate_steps=None, rate_mbps_steps=None):
     return points
 
 
-def merge_target_with_overrides(base_target, args):
-    target = dict(base_target)
-    if args.interfaces:
-        target["interfaces"] = args.interfaces
-    if args.lan_ip:
-        target["lan_ip"] = args.lan_ip
-    if args.lan_gw:
-        target["lan_gw"] = args.lan_gw
-    if args.wan_ip:
-        target["wan_ip"] = args.wan_ip
-    if args.wan_gw:
-        target["wan_gw"] = args.wan_gw
-        target["router_wan_ip"] = args.wan_gw
-    if args.router_wan_ip:
-        target["router_wan_ip"] = args.router_wan_ip
-    if args.line_rate_gbps is not None:
-        target["line_rate_gbps"] = args.line_rate_gbps
-    if args.cores is not None:
-        # --cores is an explicit runtime override.  Apply it to both the
-        # generic/STL core count and the ASTF-specific default when present.
-        target["trex_cores"] = args.cores
-        target["astf_cores"] = args.cores
-    return target
-
-
-def render_trex_cfg(target):
-    return (
-        "- port_limit      : 2\n"
-        "  version         : 2\n"
-        f"  interfaces      : [\"{target['interfaces'][0]}\", \"{target['interfaces'][1]}\"]\n"
-        "\n"
-        "  port_info:\n"
-        "      # Port 0: LAN side\n"
-        f"      - ip         : {target['lan_ip']}\n"
-        f"        default_gw : {target['lan_gw']}\n"
-        "\n"
-        "      # Port 1: WAN side\n"
-        f"      - ip         : {target['wan_ip']}\n"
-        f"        default_gw : {target['wan_gw']}\n"
-    )
-
-
-def install_trex_cfg(target, out_dir, no_install_cfg):
-    cfg_text = render_trex_cfg(target)
-    generated_cfg = out_dir / "trex_cfg.yaml"
-    generated_cfg.write_text(cfg_text, encoding="utf-8")
-    if no_install_cfg:
-        print(f"Generated TRex cfg only: {generated_cfg}")
-        return generated_cfg
-    if os.path.exists(TREX_CFG_PATH):
-        backup = out_dir / f"trex_cfg.yaml.backup_{ts_compact()}"
-        backup.write_text(Path(TREX_CFG_PATH).read_text(encoding="utf-8"), encoding="utf-8")
-        print(f"Backed up existing {TREX_CFG_PATH} to {backup}")
-    Path(TREX_CFG_PATH).write_text(cfg_text, encoding="utf-8")
-    print(f"Installed TRex cfg: {TREX_CFG_PATH}")
-    return generated_cfg
-
-
-def flatten(obj, prefix=""):
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            name = f"{prefix}.{key}" if prefix else str(key)
-            yield from flatten(value, name)
-    elif isinstance(obj, (list, tuple)):
-        for index, value in enumerate(obj):
-            name = f"{prefix}.{index}" if prefix else str(index)
-            yield from flatten(value, name)
+def build_pps_rate_points(line_rate_gbps, frame_size, rate_steps=None, pps_steps=None):
+    maximum_pps = theoretical_pps_per_port(line_rate_gbps, frame_size)
+    if pps_steps is not None:
+        values = limit_pps_steps(pps_steps, line_rate_gbps, frame_size)
     else:
-        yield prefix, obj
-
-
-def json_cell(value):
-    if value is None:
-        return ""
-    if isinstance(value, (int, float, str, bool)):
-        return value
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def write_raw_stats(writer, phase, test_name, elapsed, stats):
-    now = ts_iso()
-    for metric, value in flatten(stats):
-        writer.writerow([now, f"{elapsed:.3f}", phase, test_name, metric, json_cell(value)])
-
-
-def kill_existing_trex():
-    subprocess.run(["pkill", "-f", "_t-rex-64"], check=False)
-    subprocess.run(["pkill", "-f", "t-rex-64"], check=False)
-    subprocess.run(["pkill", "-f", "trex-console"], check=False)
-    time.sleep(3)
-
-
-DEFAULT_BENCHMARK_NAMESPACES = ("rb_lan", "rb_wan")
-
-
-def run_cmd_noexcept(cmd, timeout=15):
-    try:
-        return subprocess.run(
-            [str(x) for x in cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        class Result:
-            returncode = 999
-            stdout = ""
-            stderr = str(exc)
-        return Result()
-
-
-def sysfs_write(path, value):
-    with Path(path).open("w", encoding="utf-8") as f:
-        f.write(str(value))
-
-
-def normalize_pci_bdf(value):
-    value = str(value or "").strip()
-    if not value:
-        return ""
-    if value.count(":") == 1:
-        return f"0000:{value}"
-    return value
-
-
-def pci_device_path(bdf):
-    bdf = normalize_pci_bdf(bdf)
-    return Path("/sys/bus/pci/devices") / bdf if bdf else None
-
-
-def pci_current_driver(bdf):
-    """Return the currently bound PCI driver name, or an empty string.
-
-    Path.resolve() without strict checking can return a synthetic path ending in
-    "driver" when the sysfs driver symlink is absent.  That bogus value caused
-    later code to write to .../driver/unbind and fail.  Use the symlink target
-    only when sysfs actually exposes a driver link.
-    """
-    dev_path = pci_device_path(bdf)
-    if not dev_path:
-        return ""
-    driver_link = dev_path / "driver"
-    try:
-        if not driver_link.exists() and not driver_link.is_symlink():
-            return ""
-        return Path(os.readlink(driver_link)).name
-    except OSError:
-        try:
-            return driver_link.resolve(strict=True).name
-        except OSError:
-            return ""
-
-
-def pci_unbind_current_driver(bdf, current_driver, writer=None, required=False):
-    """Best-effort PCI unbind used before switching kernel/DPDK drivers.
-
-    Some systems transiently report a PCI device without a usable
-    /sys/bus/pci/devices/<BDF>/driver/unbind path.  Unbind is a recovery step,
-    not a measurement step, so do not abort immediately.  The caller validates
-    the final driver after bind.
-    """
-    bdf = normalize_pci_bdf(bdf)
-    current_driver = str(current_driver or "").strip()
-    if not bdf or not current_driver:
-        if writer:
-            writer.writerow([ts_iso(), "pci_unbind_skip_no_current_driver", bdf])
-        return False
-
-    candidates = [
-        pci_device_path(bdf) / "driver" / "unbind",
-        Path("/sys/bus/pci/drivers") / current_driver / "unbind",
-    ]
-    last_exc = None
-    for unbind_path in candidates:
-        if not unbind_path.exists():
-            continue
-        try:
-            sysfs_write(unbind_path, bdf)
-            if writer:
-                writer.writerow([ts_iso(), "pci_unbind", f"{bdf} from {current_driver} via {unbind_path}"])
-            return True
-        except OSError as exc:
-            last_exc = exc
-
-    msg = f"{bdf} from {current_driver}: no usable unbind path"
-    if last_exc is not None:
-        msg = f"{msg}; last_error={last_exc}"
-    if writer:
-        writer.writerow([ts_iso(), "pci_unbind_warning", msg])
-    if required:
-        raise RuntimeError(f"ERROR: failed to unbind {bdf} from {current_driver}: {msg}")
-    return False
-
-
-def namespace_exists(ns_name):
-    ns_name = str(ns_name or "").strip()
-    if not ns_name or ns_name == "root":
-        return False
-    proc = run_cmd_noexcept(["ip", "netns", "list"], timeout=10)
-    if proc.returncode != 0:
-        return False
-    return any(line.split()[0] == ns_name for line in (proc.stdout or "").splitlines() if line.strip())
-
-
-def delete_netns_force(ns_name, writer=None):
-    ns_name = str(ns_name or "").strip()
-    if not ns_name or ns_name == "root" or not namespace_exists(ns_name):
-        return
-    if writer:
-        writer.writerow([ts_iso(), "delete_stale_namespace_start", ns_name])
-    pids_proc = run_cmd_noexcept(["ip", "netns", "pids", ns_name], timeout=10)
-    pids = []
-    for item in (pids_proc.stdout or "").split():
-        try:
-            pids.append(int(item))
-        except ValueError:
-            pass
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            pass
-    if pids:
-        time.sleep(0.5)
-    for pid in pids:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
-    proc = run_cmd_noexcept(["ip", "netns", "delete", ns_name], timeout=15)
-    if writer:
-        writer.writerow([ts_iso(), "delete_stale_namespace_done", f"{ns_name} rc={proc.returncode} stderr={(proc.stderr or '').strip()}"])
-    time.sleep(0.7)
-
-
-def cleanup_benchmark_namespaces(writer=None):
-    for ns_name in DEFAULT_BENCHMARK_NAMESPACES:
-        delete_netns_force(ns_name, writer)
-
-
-def profile_port_index(target, side):
-    try:
-        return int(target.get(f"{side}_port"))
-    except (TypeError, ValueError):
-        return None
-
-
-def profile_pci_interface_entry(target, side):
-    for key in (f"{side}_pci_bdf", f"{side}_bdf", f"{side}_pci"):
-        if target.get(key):
-            return target[key]
-    interfaces = target.get("interfaces") or []
-    idx = profile_port_index(target, side)
-    if idx is not None:
-        try:
-            return interfaces[idx]
-        except (IndexError, TypeError):
-            return ""
-    return ""
-
-
-def profile_dpdk_driver_entry(target, side, override_driver=""):
-    override_driver = str(override_driver or "").strip()
-    if override_driver:
-        return override_driver
-    for key in (f"{side}_dpdk_driver", f"{side}_trex_driver"):
-        if target.get(key):
-            return str(target[key])
-    drivers = target.get("dpdk_drivers") or target.get("trex_drivers") or []
-    idx = profile_port_index(target, side)
-    if idx is not None:
-        try:
-            driver = str(drivers[idx])
-            if driver:
-                return driver
-        except (IndexError, TypeError):
-            pass
-    for key in ("dpdk_driver", "trex_driver"):
-        if target.get(key):
-            return str(target[key])
-    env_driver = str(os.environ.get("TREX_DPDK_DRIVER", "")).strip()
-    return env_driver or "auto"
-
-
-def pci_vendor_device_ids(bdf):
-    dev_path = pci_device_path(bdf)
-    if not dev_path:
-        return "", ""
-    try:
-        vendor = (dev_path / "vendor").read_text(encoding="utf-8").strip()
-    except OSError:
-        vendor = ""
-    try:
-        device = (dev_path / "device").read_text(encoding="utf-8").strip()
-    except OSError:
-        device = ""
-    return vendor, device
-
-
-def available_dpdk_driver_candidates(preferred=""):
-    preferred = str(preferred or "").strip()
-    env_driver = str(os.environ.get("TREX_DPDK_DRIVER", "")).strip()
-    candidates = []
-    if preferred and preferred.lower() != "auto":
-        candidates.append(preferred)
-    if env_driver and env_driver not in candidates:
-        candidates.append(env_driver)
-    # Prefer the classic TRex driver when present; many lab TRex installs still
-    # use igb_uio.  Then try vfio-pci, then the generic UIO driver.
-    for driver in ("igb_uio", "vfio-pci", "uio_pci_generic"):
-        if driver not in candidates:
-            candidates.append(driver)
-    return candidates
-
-
-def dpdk_driver_bind_path_exists(driver):
-    return (Path("/sys/bus/pci/drivers") / driver / "bind").exists()
-
-
-def try_modprobe_driver(driver, writer=None):
-    proc = run_cmd_noexcept(["modprobe", driver], timeout=20)
-    if writer:
-        detail = f"driver={driver} rc={proc.returncode} stderr={(proc.stderr or '').strip()}"
-        writer.writerow([ts_iso(), "modprobe_driver", detail])
-    return proc.returncode == 0
-
-
-def bind_pci_to_driver_once(bdf, driver, writer=None):
-    bdf = normalize_pci_bdf(bdf)
-    driver = str(driver or "").strip()
-    dev_path = pci_device_path(bdf)
-    if not dev_path or not dev_path.exists():
-        raise RuntimeError(f"ERROR: PCI device does not exist: {bdf}")
-
-    current = pci_current_driver(bdf)
-    if current == driver:
-        if writer:
-            writer.writerow([ts_iso(), "dpdk_driver_already_bound", f"{bdf} driver={driver}"])
-        return True
-
-    if writer:
-        writer.writerow([ts_iso(), "dpdk_bind_start", f"{bdf} current={current or '(none)'} target={driver}"])
-
-    try_modprobe_driver(driver, writer=writer)
-
-    if not dpdk_driver_bind_path_exists(driver):
-        if writer:
-            writer.writerow([ts_iso(), "dpdk_bind_path_missing", f"driver={driver}"])
-        return False
-
-    override_path = dev_path / "driver_override"
-    override_set = False
-    if override_path.exists():
-        try:
-            sysfs_write(override_path, driver)
-            override_set = True
-            if writer:
-                writer.writerow([ts_iso(), "driver_override_set", f"{bdf}->{driver}"])
-        except OSError as exc:
-            if writer:
-                writer.writerow([ts_iso(), "driver_override_warning", f"{bdf}->{driver}: {exc}"])
-
-    current = pci_current_driver(bdf)
-    if current and current != driver:
-        pci_unbind_current_driver(bdf, current, writer=writer, required=False)
-
-    bind_path = Path("/sys/bus/pci/drivers") / driver / "bind"
-    probe_path = Path("/sys/bus/pci/drivers_probe")
-    new_id_path = Path("/sys/bus/pci/drivers") / driver / "new_id"
-    attempts = []
-
-    def attempt(label, path, value):
-        try:
-            sysfs_write(path, value)
-            attempts.append(f"{label}=ok")
-            if writer:
-                writer.writerow([ts_iso(), label, f"{value} -> {path}"])
-        except OSError as exc:
-            attempts.append(f"{label}={exc}")
-            if writer:
-                writer.writerow([ts_iso(), f"{label}_warning", f"{value} -> {path}: {exc}"])
-        time.sleep(0.3)
-        return pci_current_driver(bdf) == driver
-
-    try:
-        if attempt("pci_bind", bind_path, bdf):
-            return True
-
-        if override_set and probe_path.exists():
-            if attempt("pci_drivers_probe", probe_path, bdf):
-                return True
-
-        vendor, device = pci_vendor_device_ids(bdf)
-        if vendor and device and new_id_path.exists():
-            # vfio-pci/igb_uio/uio_pci_generic may not match the device until a
-            # dynamic PCI ID is registered.  This is a standard DPDK devbind
-            # fallback and is essential after a previous failed bind left the
-            # device with no active driver.
-            if attempt("pci_new_id", new_id_path, f"{vendor} {device}"):
-                return True
-            if attempt("pci_bind_after_new_id", bind_path, bdf):
-                return True
-            if override_set and probe_path.exists():
-                if attempt("pci_drivers_probe_after_new_id", probe_path, bdf):
-                    return True
-    finally:
-        if override_path.exists():
-            try:
-                sysfs_write(override_path, "")
-                if writer:
-                    writer.writerow([ts_iso(), "driver_override_clear", bdf])
-            except OSError:
-                pass
-
-    final_driver = pci_current_driver(bdf)
-    if writer:
-        writer.writerow([ts_iso(), "dpdk_bind_candidate_failed", f"{bdf} target={driver} final={final_driver or '(none)'} attempts={' | '.join(attempts)}"])
-    return False
-
-
-def bind_pci_to_driver(bdf, driver, writer=None, required=True):
-    bdf = normalize_pci_bdf(bdf)
-    driver = str(driver or "").strip() or "auto"
-    if not bdf:
-        return False
-
-    dev_path = pci_device_path(bdf)
-    if not dev_path or not dev_path.exists():
-        raise RuntimeError(f"ERROR: PCI device does not exist: {bdf}")
-
-    current = pci_current_driver(bdf)
-    if current in ("vfio-pci", "igb_uio", "uio_pci_generic") and driver.lower() == "auto":
-        if writer:
-            writer.writerow([ts_iso(), "dpdk_driver_already_bound_auto", f"{bdf} driver={current}"])
-        return True
-
-    errors = []
-    for candidate in available_dpdk_driver_candidates(driver):
-        if not candidate:
-            continue
-        try:
-            if bind_pci_to_driver_once(bdf, candidate, writer=writer):
-                final_driver = pci_current_driver(bdf)
-                if writer:
-                    writer.writerow([ts_iso(), "dpdk_bind_done", f"{bdf} driver={final_driver}"])
-                return True
-        except Exception as exc:
-            errors.append(f"{candidate}: {exc}")
-            if writer:
-                writer.writerow([ts_iso(), "dpdk_bind_candidate_exception", f"{bdf} target={candidate}: {exc}"])
-
-    final_driver = pci_current_driver(bdf)
-    msg = (
-        f"ERROR: PCI device {bdf} could not be bound to a TRex/DPDK driver. "
-        f"final_driver={final_driver or '(none)'}, requested={driver}. "
-        "Tried: " + ", ".join(available_dpdk_driver_candidates(driver))
-    )
-    if errors:
-        msg += "; errors: " + " | ".join(errors)
-    msg += " Set TREX_DPDK_DRIVER or pass --dpdk-driver if this host uses a specific driver."
-    if required:
-        raise RuntimeError(msg)
-    if writer:
-        writer.writerow([ts_iso(), "dpdk_bind_failed_non_required", msg])
-    return False
-
-
-def prepare_trex_interfaces_from_profile(target, out_dir, auto_dpdk_bind=True, dpdk_driver_override=""):
-    """Prepare NIC state for TRex after L4 namespace/kernel-driver tests.
-
-    L4 latency tests move Linux netdevs into namespaces and bind the NICs to
-    kernel drivers.  TRex STL/ASTF requires the PCI devices to be back on the
-    configured DPDK driver.  This function removes stale benchmark namespaces
-    and, when enabled, binds the profile PCI devices to the profile DPDK driver.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = out_dir / "trex_interface_prepare.csv"
-    with log_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["ts_local", "action", "detail"])
-        cleanup_benchmark_namespaces(writer)
-        if not auto_dpdk_bind:
-            writer.writerow([ts_iso(), "dpdk_bind_disabled", "--no-auto-dpdk-bind"])
-            return log_path
-        for side in ("lan", "wan"):
-            bdf = profile_pci_interface_entry(target, side)
-            driver = profile_dpdk_driver_entry(target, side, dpdk_driver_override)
-            bind_pci_to_driver(bdf, driver, writer=writer, required=True)
-    return log_path
-
-
-def wait_rpc(timeout=60):
-    start = time.time()
-    while time.time() - start < timeout:
-        ok = True
-        for port in (4500, 4501):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
-            try:
-                sock.connect(("127.0.0.1", port))
-            except OSError:
-                ok = False
-            finally:
-                sock.close()
-        if ok:
-            return
-        time.sleep(1)
-    raise RuntimeError("TRex RPC ports did not become ready")
-
-
-def tail_text(path, max_lines=80):
-    try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    return "\n".join(lines[-int(max_lines):])
-
-
-def _trex_link_up_from_attr(attr):
-    if not isinstance(attr, dict):
-        return False
-    for key in ("link_up", "is_link_up", "up"):
-        value = attr.get(key)
-        if isinstance(value, bool):
-            return value
-    link = attr.get("link")
-    if isinstance(link, bool):
-        return link
-    if isinstance(link, str):
-        return link.strip().upper() == "UP"
-    if isinstance(link, dict):
-        for key in ("up", "link_up", "is_up"):
-            value = link.get(key)
-            if isinstance(value, bool):
-                return value
-        status = link.get("status") or link.get("state")
-        if isinstance(status, str):
-            return status.strip().upper() == "UP"
-    return False
-
-
-def wait_trex_ports_link_up(client, ports, timeout_sec=45.0, poll_interval_sec=0.5):
-    deadline = time.monotonic() + float(timeout_sec)
-    last = {}
-    while time.monotonic() < deadline:
-        all_up = True
-        last = {}
-        for port in ports:
-            try:
-                attr = client.get_port_attr(port)
-            except Exception as exc:
-                attr = {"error": str(exc)}
-            last[port] = attr
-            if not _trex_link_up_from_attr(attr):
-                all_up = False
-        if all_up:
-            return last
-        time.sleep(float(poll_interval_sec))
-    raise RuntimeError(f"TRex port link did not become UP within {timeout_sec:g}s: {last}")
+        values = [maximum_pps * (float(pct) / 100.0) for pct in sorted(set(rate_steps))]
+    points = []
+    for pps in values:
+        bps_l1 = pps * (frame_size + L1_OVERHEAD_BYTES) * 8
+        points.append({
+            "label": f"{fmt_rate_value(pps)}pps",
+            "rate_pps": pps,
+            "rate_mbps": bps_l1 / 1_000_000.0,
+            "rate_percent": (pps / maximum_pps) * 100.0,
+            "bps_l1": bps_l1,
+        })
+    return points
 
 
 class TrexStlServer:
@@ -797,8 +356,8 @@ class TrexStlServer:
             self.log_file = None
 
 
-def payload_for_l2_size(frame_size):
-    payload_len = frame_size - 14 - 20 - 8  # Ethernet + IPv4 + UDP
+def payload_for_l2_size(frame_size, ip_header_bytes=20):
+    payload_len = frame_size - 14 - int(ip_header_bytes) - 8
     if payload_len < 0:
         raise ValueError(f"frame_size too small: {frame_size}")
     return b"X" * payload_len
@@ -986,13 +545,17 @@ def build_refine_steps(rows, lossless_threshold, step):
 
 
 def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, rate_mbps_steps,
-                  refine_step, lossless_threshold, stop_on_first_loss, single_load_percent,
+                  pps_steps, refine_step, lossless_threshold, stop_on_first_loss,
+                  high_loss_threshold, high_loss_consecutive, recovery_probe_interval_sec,
+                  recovery_success_consecutive, recovery_timeout_sec,
+                  lan_source_port_range, single_load_percent,
                   test_start_delay_sec=DEFAULT_TEST_START_DELAY_SEC):
     add_trex_api_path()
     from trex.stl.api import (
         STLClient,
         Ether,
         IP,
+        IPv6,
         UDP,
         Raw,
         STLStream,
@@ -1005,6 +568,11 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
     wan_port = target["wan_port"]
     ports = [lan_port, wan_port]
     line_rate_gbps = float(target["line_rate_gbps"])
+    is_ipv6 = target.get("ip_version") == "v6"
+    ip_layer = IPv6 if is_ipv6 else IP
+    ip_header_bytes = 40 if is_ipv6 else 20
+    diagnostic_frame = max(FRAME_64, 128 if is_ipv6 else FRAME_64)
+    lan_source_port = first_lan_source_port(lan_source_port_range, UDP_PORT)
 
     class StepPreflightError(RuntimeError):
         pass
@@ -1034,9 +602,20 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         "probe_down_success_rate",
         "detail",
     ]
+    recovery_fields = [
+        "ts_local",
+        "test_name",
+        "attempt",
+        "status",
+        "consecutive_successes",
+        "required_consecutive_successes",
+        "elapsed_sec",
+        "recovery_complete",
+        "detail",
+    ]
 
     def payload_with_marker(prefix, test_name, frame_size):
-        payload_len = frame_size - 14 - 20 - 8
+        payload_len = frame_size - 14 - ip_header_bytes - 8
         if payload_len < 8:
             raise ValueError(f"frame_size too small for diagnostic marker: {frame_size}")
         digest = zlib.crc32(test_name.encode("utf-8")) & 0xFFFFFFFF
@@ -1057,22 +636,27 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             return ""
         return normalized
 
-    def pkt_up(frame_size, mac_ctx, udp_sport=UDP_PORT, udp_dport=UDP_PORT, payload=None):
+    def pkt_up(frame_size, mac_ctx, udp_sport=None, udp_dport=UDP_PORT, payload=None):
         if payload is None:
-            payload = payload_for_l2_size(frame_size)
+            payload = payload_for_l2_size(frame_size, ip_header_bytes)
+        if udp_sport is None:
+            udp_sport = lan_source_port
         return (
             Ether(src=mac_ctx["lan_src_mac"], dst=mac_ctx["lan_router_mac"])
-            / IP(src=target["lan_ip"], dst=target["wan_ip"])
+            / ip_layer(src=target["lan_ip"], dst=target["wan_ip"])
             / UDP(sport=int(udp_sport), dport=int(udp_dport))
             / Raw(load=payload)
         )
 
-    def pkt_down(frame_size, mac_ctx, nat_external_port, udp_sport=UDP_PORT, payload=None):
+    def pkt_down(frame_size, mac_ctx, nat_external_port=UDP_PORT, udp_sport=UDP_PORT, payload=None):
         if payload is None:
-            payload = payload_for_l2_size(frame_size)
+            payload = payload_for_l2_size(frame_size, ip_header_bytes)
         return (
             Ether(src=mac_ctx["wan_src_mac"], dst=mac_ctx["wan_router_mac"])
-            / IP(src=target["wan_ip"], dst=target["router_wan_ip"])
+            / ip_layer(
+                src=target["wan_ip"],
+                dst=target["lan_ip"] if is_ipv6 else target["router_wan_ip"],
+            )
             / UDP(sport=int(udp_sport), dport=int(nat_external_port))
             / Raw(load=payload)
         )
@@ -1082,9 +666,14 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         if direction == "up":
             packet = pkt_up(frame_size, mac_ctx, payload=payload)
         elif direction == "down":
-            if nat_external_port is None:
+            if nat_external_port is None and not is_ipv6:
                 raise ValueError("nat_external_port is required for downlink streams")
-            packet = pkt_down(frame_size, mac_ctx, nat_external_port, payload=payload)
+            packet = pkt_down(
+                frame_size,
+                mac_ctx,
+                lan_source_port if nat_external_port is None else nat_external_port,
+                payload=payload,
+            )
         else:
             raise ValueError(direction)
 
@@ -1121,7 +710,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                 if int(item.get("port", -1)) != int(expected_port):
                     continue
                 packet = Ether(item["binary"])
-                if IP not in packet or UDP not in packet:
+                if ip_layer not in packet or UDP not in packet:
                     continue
                 udp_payload = bytes(packet[UDP].payload)
                 if not udp_payload.startswith(marker):
@@ -1147,7 +736,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                 rx_ports=[rx_port],
                 limit=int(capture_limit),
                 mode="fixed",
-                bpf_filter="udp",
+                bpf_filter="ip6 and udp" if is_ipv6 else "ip and udp",
             )
             capture_id = capture["id"]
             client.add_streams(stream, ports=[tx_port])
@@ -1189,6 +778,8 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
 
     def resolve_step_macs(client):
         wait_trex_ports_link_up(client, ports)
+        if is_ipv6:
+            return resolve_ipv6_gateway_macs(client, target)
         client.set_service_mode(ports=ports, enabled=True)
         try:
             client.arp(ports=ports, retries=2)
@@ -1235,11 +826,11 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             )
 
     def warm_nat_and_discover_port(client, test_name, mac_ctx):
-        marker, payload = payload_with_marker(b"RBWN", test_name, FRAME_64)
+        marker, payload = payload_with_marker(b"RBWN", test_name, diagnostic_frame)
         stream = make_stream(
             f"{test_name}_warm_nat",
             "up",
-            FRAME_64,
+            diagnostic_frame,
             mac_ctx,
             pps=1000,
             payload=payload,
@@ -1282,11 +873,11 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
 
     def probe_up(client, test_name, mac_ctx):
         probe_packets = 32
-        marker, payload = payload_with_marker(b"RBUP", test_name, FRAME_64)
+        marker, payload = payload_with_marker(b"RBUP", test_name, diagnostic_frame)
         stream = make_stream(
             f"{test_name}_probe_up",
             "up",
-            FRAME_64,
+            diagnostic_frame,
             mac_ctx,
             pps=1000,
             total_pkts=probe_packets,
@@ -1304,8 +895,10 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         matched = []
         for packet in parse_capture(captured, wan_port, marker):
             if (
-                packet[IP].src == target["router_wan_ip"]
-                and packet[IP].dst == target["wan_ip"]
+                packet[ip_layer].src == (
+                    target["lan_ip"] if is_ipv6 else target["router_wan_ip"]
+                )
+                and packet[ip_layer].dst == target["wan_ip"]
                 and int(packet[UDP].dport) == UDP_PORT
             ):
                 matched.append(packet)
@@ -1332,11 +925,11 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
 
     def probe_down(client, test_name, mac_ctx, nat_external_port):
         probe_packets = 32
-        marker, payload = payload_with_marker(b"RBDN", test_name, FRAME_64)
+        marker, payload = payload_with_marker(b"RBDN", test_name, diagnostic_frame)
         stream = make_stream(
             f"{test_name}_probe_down",
             "down",
-            FRAME_64,
+            diagnostic_frame,
             mac_ctx,
             nat_external_port=nat_external_port,
             pps=1000,
@@ -1355,10 +948,10 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         matched = []
         for packet in parse_capture(captured, lan_port, marker):
             if (
-                packet[IP].src == target["wan_ip"]
-                and packet[IP].dst == target["lan_ip"]
+                packet[ip_layer].src == target["wan_ip"]
+                and packet[ip_layer].dst == target["lan_ip"]
                 and int(packet[UDP].sport) == UDP_PORT
-                and int(packet[UDP].dport) == UDP_PORT
+                and int(packet[UDP].dport) == lan_source_port
             ):
                 matched.append(packet)
         tx_pkts = safe_stat(stats, wan_port, "opackets")
@@ -1397,7 +990,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             "ts_local": ts_iso(),
             "test_name": test_name,
             "status": "error",
-            "warm_nat_internal_udp_port": UDP_PORT,
+            "warm_nat_internal_udp_port": lan_source_port,
         }
         try:
             client.reset(ports=ports)
@@ -1406,14 +999,17 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             mac_ctx = resolve_step_macs(client)
             diag.update(mac_ctx)
 
-            warm = warm_nat_and_discover_port(client, test_name, mac_ctx)
-            warm_nat_port = warm["nat_external_udp_port"]
-            diag.update({
-                "warm_nat_external_udp_port": warm_nat_port,
-                "warm_nat_tx_pkts": warm["tx_pkts"],
-                "warm_nat_wan_rx_pkts": warm["wan_rx_pkts"],
-                "warm_nat_capture_matches": warm["capture_matches"],
-            })
+            if is_ipv6:
+                warm_nat_port = lan_source_port
+            else:
+                warm = warm_nat_and_discover_port(client, test_name, mac_ctx)
+                warm_nat_port = warm["nat_external_udp_port"]
+                diag.update({
+                    "warm_nat_external_udp_port": warm_nat_port,
+                    "warm_nat_tx_pkts": warm["tx_pkts"],
+                    "warm_nat_wan_rx_pkts": warm["wan_rx_pkts"],
+                    "warm_nat_capture_matches": warm["capture_matches"],
+                })
 
             up = probe_up(client, test_name, mac_ctx)
             nat_external_port = up["nat_external_udp_port"]
@@ -1445,6 +1041,54 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             diag["detail"] = f"{type(exc).__name__}: {exc}"
             preflight_writer.writerow(diag)
             raise StepPreflightError(str(exc)) from exc
+
+    def wait_for_recovery(client, test_name, preflight_writer, recovery_writer):
+        started = time.monotonic()
+        attempt = 0
+        consecutive = 0
+        while consecutive < recovery_success_consecutive:
+            time.sleep(recovery_probe_interval_sec)
+            attempt += 1
+            detail = ""
+            try:
+                preflight = run_preflight(client, test_name, preflight_writer)
+                consecutive += 1
+                status = "ok"
+            except StepPreflightError as exc:
+                preflight = None
+                consecutive = 0
+                status = "error"
+                detail = str(exc)
+            elapsed = time.monotonic() - started
+            complete = int(consecutive >= recovery_success_consecutive)
+            recovery_writer.writerow({
+                "ts_local": ts_iso(),
+                "test_name": test_name,
+                "attempt": attempt,
+                "status": status,
+                "consecutive_successes": consecutive,
+                "required_consecutive_successes": recovery_success_consecutive,
+                "elapsed_sec": round(elapsed, 6),
+                "recovery_complete": complete,
+                "detail": detail,
+            })
+            if complete:
+                print(
+                    f"--- Recovery confirmed for {test_name}: "
+                    f"{consecutive} consecutive probes, {elapsed:.3f}s ---"
+                )
+                return preflight
+            if recovery_timeout_sec > 0 and elapsed >= recovery_timeout_sec:
+                raise StepPreflightError(
+                    f"preflight recovery timed out after {elapsed:.3f}s for "
+                    f"{test_name}; required={recovery_success_consecutive} "
+                    f"consecutive successes"
+                )
+            print(
+                f"--- Recovery probe {test_name}: status={status}, "
+                f"consecutive={consecutive}/{recovery_success_consecutive}, "
+                f"elapsed={elapsed:.3f}s ---"
+            )
 
     def direction_metrics(stats, direction, frame_size, duration_sec, active):
         if not active:
@@ -1527,6 +1171,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
 
         result = {
             "phase": "stl_rate_search" if rate_search else "stl_single_load",
+            "ip_version": target.get("ip_version", "v4"),
             "test_name": test["name"],
             "base_test_name": test.get("base_name", test["name"]),
             "repeat": test.get("repeat", ""),
@@ -1534,7 +1179,9 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             "frame_size": frame_size,
             "duration_sec": duration_sec,
             "rate_percent": test.get("rate_percent", ""),
+            "rate_mode": test.get("rate_mode", "mbps"),
             "rate_mbps_per_active_port": test.get("rate_mbps", ""),
+            "requested_pps_per_active_port": test.get("rate_pps", ""),
             "bps_l1_per_active_port": test.get("bps_l1", ""),
             "line_rate_gbps": line_rate_gbps,
             "tx_pkts": tx_pkts,
@@ -1564,8 +1211,8 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             "lan_router_mac": preflight["lan_router_mac"],
             "wan_src_mac": preflight["wan_src_mac"],
             "wan_router_mac": preflight["wan_router_mac"],
-            "nat_internal_udp_port": UDP_PORT,
-            "nat_external_udp_port": preflight["nat_external_udp_port"],
+            "nat_internal_udp_port": lan_source_port,
+            "nat_external_udp_port": "" if is_ipv6 else preflight["nat_external_udp_port"],
             "warm_nat_capture_matches": preflight["diag"].get("warm_nat_capture_matches", ""),
             "probe_up_success_rate": preflight["diag"].get("probe_up_success_rate", ""),
             "probe_down_success_rate": preflight["diag"].get("probe_down_success_rate", ""),
@@ -1576,35 +1223,45 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                 result[f"{prefix}_{key}"] = value
         return result
 
-    def run_one_test(client, test, raw_writer, preflight_writer):
+    def run_one_test(client, test, raw_writer, preflight_writer, recovery_writer):
         name = test["name"]
         direction = test["direction"]
         frame_size = test["frame_size"]
         bps_l1 = test.get("bps_l1", None)
+        rate_pps = test.get("rate_pps", None)
         rate_mbps = test.get("rate_mbps", "")
         rate_percent = test.get("rate_percent", "")
+        if rate_pps is None:
+            rate_text = f"{fmt_rate_value(rate_mbps)}Mbps"
+        else:
+            rate_text = f"{fmt_rate_value(rate_pps)}pps"
         print(
             f"=== STL {name}: direction={direction}, frame={frame_size}, "
-            f"rate={fmt_rate_value(rate_mbps)}Mbps ({rate_percent:g}%), "
-            f"bps_L1={bps_l1}, duration={duration}s ==="
+            f"rate={rate_text} ({rate_percent:g}%), bps_L1={bps_l1}, "
+            f"duration={duration}s ==="
         )
-        print(f"--- Preflight {name}: ARP, explicit MAC, warm NAT, NAT port discovery, up/down probe ---")
-        preflight = run_preflight(client, name, preflight_writer)
+        if is_ipv6:
+            print(f"--- Preflight {name}: NDP, explicit MAC, up/down probe ---")
+        else:
+            print(f"--- Preflight {name}: ARP, explicit MAC, warm NAT, NAT port discovery, up/down probe ---")
+        preflight = wait_for_recovery(client, name, preflight_writer, recovery_writer)
         nat_external_port = preflight["nat_external_udp_port"]
+        rate_kwargs = {"pps": rate_pps} if rate_pps is not None else {"bps_l1": bps_l1}
 
         stop_and_remove_streams(client)
         client.clear_stats(ports=ports)
         if direction == "up":
             client.add_streams(
-                make_stream(f"{name}_up", "up", frame_size, preflight, bps_l1=bps_l1),
+                make_stream(f"{name}_up", "up", frame_size, preflight, **rate_kwargs),
                 ports=[lan_port],
             )
             active_ports = [lan_port]
         elif direction == "down":
-            client.add_streams(
-                make_stream(f"{name}_keepalive", "up", FRAME_64, preflight, pps=1),
-                ports=[lan_port],
-            )
+            if not is_ipv6:
+                client.add_streams(
+                    make_stream(f"{name}_keepalive", "up", FRAME_64, preflight, pps=1),
+                    ports=[lan_port],
+                )
             client.add_streams(
                 make_stream(
                     f"{name}_down",
@@ -1612,14 +1269,14 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                     frame_size,
                     preflight,
                     nat_external_port=nat_external_port,
-                    bps_l1=bps_l1,
+                    **rate_kwargs,
                 ),
                 ports=[wan_port],
             )
-            active_ports = [lan_port, wan_port]
+            active_ports = [wan_port] if is_ipv6 else [lan_port, wan_port]
         elif direction == "bidir":
             client.add_streams(
-                make_stream(f"{name}_up", "up", frame_size, preflight, bps_l1=bps_l1),
+                make_stream(f"{name}_up", "up", frame_size, preflight, **rate_kwargs),
                 ports=[lan_port],
             )
             client.add_streams(
@@ -1629,7 +1286,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                     frame_size,
                     preflight,
                     nat_external_port=nat_external_port,
-                    bps_l1=bps_l1,
+                    **rate_kwargs,
                 ),
                 ports=[wan_port],
             )
@@ -1659,16 +1316,84 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         return calc_summary(test, delta_stats, duration, preflight)
 
     base_tests = [
-        {"base_name": "large_down_throughput", "direction": "down", "frame_size": FRAME_LARGE},
-        {"base_name": "large_up_throughput", "direction": "up", "frame_size": FRAME_LARGE},
-        {"base_name": "large_bidir_throughput", "direction": "bidir", "frame_size": FRAME_LARGE},
-        {"base_name": "udp64_down_pps", "direction": "down", "frame_size": FRAME_64},
-        {"base_name": "udp64_up_pps", "direction": "up", "frame_size": FRAME_64},
-        {"base_name": "udp64_bidir_pps", "direction": "bidir", "frame_size": FRAME_64},
+        {"base_name": "large_down_throughput", "direction": "down", "frame_size": FRAME_LARGE, "rate_mode": "mbps"},
+        {"base_name": "large_up_throughput", "direction": "up", "frame_size": FRAME_LARGE, "rate_mode": "mbps"},
+        {"base_name": "large_bidir_throughput", "direction": "bidir", "frame_size": FRAME_LARGE, "rate_mode": "mbps"},
+        {"base_name": "udp64_down_pps", "direction": "down", "frame_size": FRAME_64, "rate_mode": "pps"},
+        {"base_name": "udp64_up_pps", "direction": "up", "frame_size": FRAME_64, "rate_mode": "pps"},
+        {"base_name": "udp64_bidir_pps", "direction": "bidir", "frame_size": FRAME_64, "rate_mode": "pps"},
     ]
+
+    def rate_points_for_base(base):
+        if base["rate_mode"] == "pps":
+            return build_pps_rate_points(
+                line_rate_gbps,
+                base["frame_size"],
+                rate_steps=rate_steps,
+                pps_steps=pps_steps,
+            )
+        return build_rate_points(
+            line_rate_gbps,
+            rate_steps=rate_steps,
+            rate_mbps_steps=rate_mbps_steps,
+        )
+
+    def rate_point_for_percent(base, pct, label):
+        pct = float(pct)
+        if base["rate_mode"] == "pps":
+            maximum_pps = theoretical_pps_per_port(line_rate_gbps, base["frame_size"])
+            pps = maximum_pps * (pct / 100.0)
+            bps_l1 = pps * (base["frame_size"] + L1_OVERHEAD_BYTES) * 8
+            return {
+                "label": label,
+                "rate_pps": pps,
+                "rate_mbps": bps_l1 / 1_000_000.0,
+                "rate_percent": pct,
+                "bps_l1": bps_l1,
+            }
+        mbps = (line_rate_gbps * 1000.0) * (pct / 100.0)
+        return {
+            "label": label,
+            "rate_pps": None,
+            "rate_mbps": mbps,
+            "rate_percent": pct,
+            "bps_l1": mbps * 1_000_000.0,
+        }
+
+    def make_test(base, repeat_index, rate_point):
+        return {
+            "name": f"r{repeat_index}_{base['base_name']}_{rate_point['label']}",
+            "base_name": base["base_name"],
+            "repeat": repeat_index,
+            "direction": base["direction"],
+            "frame_size": base["frame_size"],
+            "duration": duration,
+            "rate_mode": base["rate_mode"],
+            "rate_percent": rate_point["rate_percent"],
+            "rate_mbps": rate_point["rate_mbps"],
+            "rate_pps": rate_point.get("rate_pps"),
+            "bps_l1": rate_point["bps_l1"],
+        }
+
+    def measurement_error_row(test, base, repeat_index, exc, phase):
+        return {
+            "phase": phase,
+            "repeat": repeat_index,
+            "test_name": test["name"],
+            "base_test_name": base["base_name"],
+            "direction": base["direction"],
+            "rate_mode": base["rate_mode"],
+            "rate_percent": test["rate_percent"],
+            "rate_mbps_per_active_port": test["rate_mbps"],
+            "requested_pps_per_active_port": test.get("rate_pps", ""),
+            "preflight_ok": 0 if isinstance(exc, StepPreflightError) else 1,
+            "error_stage": "preflight" if isinstance(exc, StepPreflightError) else "measurement",
+            "error": traceback.format_exc(),
+        }
 
     raw_csv = out_dir / "stl_raw.csv"
     preflight_csv = out_dir / "stl_preflight.csv"
+    recovery_csv = out_dir / "stl_recovery.csv"
     summaries = []
     client = STLClient(server="127.0.0.1")
     client.connect()
@@ -1679,135 +1404,80 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         wait_before_test_start(test_start_delay_sec, "STL throughput/PPS benchmark")
         with open(raw_csv, "w", newline="") as raw_file, open(
             preflight_csv, "w", newline=""
-        ) as preflight_file:
+        ) as preflight_file, open(recovery_csv, "w", newline="") as recovery_file:
             raw_writer = csv.writer(raw_file)
             raw_writer.writerow(["ts_local", "elapsed_sec", "phase", "test_name", "metric", "value"])
             preflight_writer = csv.DictWriter(preflight_file, fieldnames=preflight_fields, extrasaction="ignore")
             preflight_writer.writeheader()
+            recovery_writer = csv.DictWriter(recovery_file, fieldnames=recovery_fields, extrasaction="ignore")
+            recovery_writer.writeheader()
             for r in range(1, repeat + 1):
                 for base in base_tests:
                     if rate_search:
                         step_rows = []
-                        for rate_point in build_rate_points(
-                            line_rate_gbps,
-                            rate_steps=rate_steps,
-                            rate_mbps_steps=rate_mbps_steps,
-                        ):
-                            pct = rate_point["rate_percent"]
-                            mbps = rate_point["rate_mbps"]
-                            bps_l1 = rate_point["bps_l1"]
-                            label = rate_point["label"]
-                            test = {
-                                "name": f"r{r}_{base['base_name']}_{label}",
-                                "base_name": base["base_name"],
-                                "repeat": r,
-                                "direction": base["direction"],
-                                "frame_size": base["frame_size"],
-                                "duration": duration,
-                                "rate_percent": pct,
-                                "rate_mbps": mbps,
-                                "bps_l1": bps_l1,
-                            }
+                        high_loss_streak = 0
+                        stopped_for_high_loss = False
+                        for rate_point in rate_points_for_base(base):
+                            test = make_test(base, r, rate_point)
                             try:
-                                row = run_one_test(client, test, raw_writer, preflight_writer)
+                                row = run_one_test(client, test, raw_writer, preflight_writer, recovery_writer)
                                 summaries.append(row)
                                 step_rows.append(row)
+                                high_loss_streak = high_loss_streak_update(
+                                    high_loss_streak,
+                                    metric_float(row, "worst_direction_loss_rate", metric_float(row, "loss_rate", 0.0)),
+                                    high_loss_threshold,
+                                )
+                                if high_loss_streak >= high_loss_consecutive:
+                                    print(
+                                        f"Stopping {base['base_name']} after {high_loss_streak} consecutive "
+                                        f"measurements with packet loss >= {high_loss_threshold:.1%}."
+                                    )
+                                    stopped_for_high_loss = True
+                                    break
                                 if stop_on_first_loss and not row_passes(row, lossless_threshold):
                                     print(
-                                        f"Stopping {base['base_name']} at {fmt_rate_value(mbps)}Mbps "
-                                        f"({pct:g}%) because loss/error was detected."
+                                        f"Stopping {base['base_name']} at {rate_point['label']} "
+                                        f"because loss/error was detected."
                                     )
                                     break
                             except Exception as exc:
-                                error_row = {
-                                    "phase": "stl_rate_search",
-                                    "repeat": r,
-                                    "test_name": test["name"],
-                                    "base_test_name": base["base_name"],
-                                    "direction": base["direction"],
-                                    "rate_percent": pct,
-                                    "rate_mbps_per_active_port": mbps,
-                                    "preflight_ok": 0 if isinstance(exc, StepPreflightError) else 1,
-                                    "error_stage": "preflight" if isinstance(exc, StepPreflightError) else "measurement",
-                                    "error": traceback.format_exc(),
-                                }
+                                high_loss_streak = 0
+                                error_row = measurement_error_row(test, base, r, exc, "stl_rate_search")
                                 print(error_row["error"])
                                 summaries.append(error_row)
                             raw_file.flush()
                             preflight_file.flush()
-                            time.sleep(5)
-                        for pct in build_refine_steps(step_rows, lossless_threshold, refine_step):
-                            bps_l1 = line_rate_gbps * 1_000_000_000 * (pct / 100.0)
-                            mbps = (line_rate_gbps * 1000.0) * (pct / 100.0)
-                            test = {
-                                "name": f"r{r}_{base['base_name']}_{pct:g}pct_refine",
-                                "base_name": base["base_name"],
-                                "repeat": r,
-                                "direction": base["direction"],
-                                "frame_size": base["frame_size"],
-                                "duration": duration,
-                                "rate_percent": pct,
-                                "rate_mbps": mbps,
-                                "bps_l1": bps_l1,
-                            }
-                            try:
-                                row = run_one_test(client, test, raw_writer, preflight_writer)
-                                summaries.append(row)
-                                step_rows.append(row)
-                            except Exception as exc:
-                                error_row = {
-                                    "phase": "stl_rate_search_refine",
-                                    "repeat": r,
-                                    "test_name": test["name"],
-                                    "base_test_name": base["base_name"],
-                                    "direction": base["direction"],
-                                    "rate_percent": pct,
-                                    "rate_mbps_per_active_port": mbps,
-                                    "preflight_ok": 0 if isinstance(exc, StepPreflightError) else 1,
-                                    "error_stage": "preflight" if isinstance(exc, StepPreflightError) else "measurement",
-                                    "error": traceback.format_exc(),
-                                }
-                                print(error_row["error"])
-                                summaries.append(error_row)
-                            raw_file.flush()
-                            preflight_file.flush()
-                            time.sleep(5)
+                            recovery_file.flush()
+                        if not stopped_for_high_loss:
+                            for pct in build_refine_steps(step_rows, lossless_threshold, refine_step):
+                                point = rate_point_for_percent(base, pct, f"{pct:g}pct_refine")
+                                test = make_test(base, r, point)
+                                try:
+                                    row = run_one_test(client, test, raw_writer, preflight_writer, recovery_writer)
+                                    summaries.append(row)
+                                    step_rows.append(row)
+                                except Exception as exc:
+                                    error_row = measurement_error_row(test, base, r, exc, "stl_rate_search_refine")
+                                    print(error_row["error"])
+                                    summaries.append(error_row)
+                                raw_file.flush()
+                                preflight_file.flush()
+                                recovery_file.flush()
                         summaries.append(make_rate_search_result(base["base_name"], r, step_rows, lossless_threshold))
                     else:
                         pct = float(single_load_percent)
-                        mbps = (line_rate_gbps * 1000.0) * (pct / 100.0)
-                        bps_l1 = line_rate_gbps * 1_000_000_000 * (pct / 100.0)
-                        test = {
-                            "name": f"r{r}_{base['base_name']}_{pct:g}pct",
-                            "base_name": base["base_name"],
-                            "repeat": r,
-                            "direction": base["direction"],
-                            "frame_size": base["frame_size"],
-                            "duration": duration,
-                            "rate_percent": pct,
-                            "rate_mbps": mbps,
-                            "bps_l1": bps_l1,
-                        }
+                        point = rate_point_for_percent(base, pct, f"{pct:g}pct")
+                        test = make_test(base, r, point)
                         try:
-                            summaries.append(run_one_test(client, test, raw_writer, preflight_writer))
+                            summaries.append(run_one_test(client, test, raw_writer, preflight_writer, recovery_writer))
                         except Exception as exc:
-                            error_row = {
-                                "phase": "stl_single_load",
-                                "repeat": r,
-                                "test_name": test["name"],
-                                "base_test_name": base["base_name"],
-                                "direction": base["direction"],
-                                "rate_percent": pct,
-                                "rate_mbps_per_active_port": mbps,
-                                "preflight_ok": 0 if isinstance(exc, StepPreflightError) else 1,
-                                "error_stage": "preflight" if isinstance(exc, StepPreflightError) else "measurement",
-                                "error": traceback.format_exc(),
-                            }
+                            error_row = measurement_error_row(test, base, r, exc, "stl_single_load")
                             print(error_row["error"])
                             summaries.append(error_row)
                         raw_file.flush()
                         preflight_file.flush()
-                        time.sleep(5)
+                        recovery_file.flush()
     finally:
         stop_and_remove_streams(client)
         try:
@@ -1817,20 +1487,8 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         client.disconnect()
     return summaries
 
-def write_summary_csv(path, summaries):
-    keys = []
-    for row in summaries:
-        for key in row.keys():
-            if key not in keys:
-                keys.append(key)
-    with open(path, "w", newline="") as out_file:
-        writer = csv.DictWriter(out_file, fieldnames=keys)
-        writer.writeheader()
-        for row in summaries:
-            writer.writerow(row)
-
-
 def write_metadata(out_dir, target_name, target, args):
+    is_ipv6 = target.get("ip_version") == "v6"
     metadata = {
         "created_at": ts_iso(),
         "target_name": target_name,
@@ -1838,16 +1496,22 @@ def write_metadata(out_dir, target_name, target, args):
         "args": vars(args),
         "trex_dir": TREX_DIR,
         "trex_cfg_path": TREX_CFG_PATH,
-        "mode": "stl_only_throughput_pps",
+        "mode": "native_ipv6_stl_throughput_pps" if is_ipv6 else "stl_only_throughput_pps",
         "per_step_preflight": {
-            "arp_refresh": True,
+            "neighbor_discovery": "ndp" if is_ipv6 else "arp",
             "explicit_mac_headers": True,
-            "warm_nat_seconds": 3,
-            "nat_udp_port_capture": True,
+            "warm_nat_seconds": 0 if is_ipv6 else 3,
+            "nat_udp_port_capture": not is_ipv6,
             "uplink_probe_packets": 32,
             "downlink_probe_packets": 32,
             "minimum_probe_capture_rate": 0.9,
             "output": "stl_preflight.csv",
+        },
+        "per_step_recovery": {
+            "probe_interval_sec": args.recovery_probe_interval_sec,
+            "required_consecutive_successes": args.recovery_success_consecutive,
+            "timeout_sec": args.recovery_timeout_sec,
+            "output": "stl_recovery.csv",
         },
         "directional_statistics": ["combined", "up", "down"],
         "tests": [
@@ -1863,34 +1527,47 @@ def write_metadata(out_dir, target_name, target, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run TRex STL-only IPv4 NAT throughput/PPS benchmark.")
-    parser.add_argument("--target", choices=TARGETS.keys(), default="i226_1g")
+    parser = argparse.ArgumentParser(description="Run TRex STL throughput/PPS benchmark.")
+    parser.add_argument("--ip-version", choices=("v4", "v6"), default="v4", help=argparse.SUPPRESS)
+    parser.add_argument("--target", choices=TARGETS.keys(), default=_STL_DEFAULTS["target"])
     parser.add_argument("--out-dir", default="", help="Result directory. Default: /var/trex/trex_stl_throughput_pps_<target>_<timestamp>/.")
-    parser.add_argument("--duration", type=int, default=20)
-    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--duration", type=int, default=_STL_DEFAULTS["duration_sec"])
+    parser.add_argument("--repeat", type=int, default=_STL_DEFAULTS["repeat"])
     parser.add_argument("--test-start-delay-sec", type=float, default=DEFAULT_TEST_START_DELAY_SEC,
                         help="Seconds to wait after TRex ports report link-up and before the first measured test. Default: 15.")
 
     parser.add_argument("--rate-search", dest="rate_search", action="store_true", help="Enable rate search. Default: enabled.")
     parser.add_argument("--stl-rate-search", dest="rate_search", action="store_true", help="Compatibility alias for --rate-search.")
     parser.add_argument("--no-rate-search", dest="rate_search", action="store_false", help="Run one fixed-load point only.")
-    parser.set_defaults(rate_search=True)
+    parser.set_defaults(rate_search=_STL_DEFAULTS["rate_search"])
 
     parser.add_argument("--rate-steps", type=parse_rate_steps, default=None,
                         help="Compatibility option: percent steps. If omitted, Mbps steps are used.")
     parser.add_argument("--rate-mbps-steps", "--rate-steps-mbps", dest="rate_mbps_steps",
                         type=parse_rate_mbps_steps, default=None,
-                        help="L1 Mbps steps per active port. Default: 100,150,220,330,470,680,1000,1500,2200,(line rate),3300,4700,(line rate),6800,10000 up to the configured line rate.")
-    parser.add_argument("--refine-step", type=float, default=0.0,
+                        help="L1 Mbps steps per active port for large-frame throughput. Default: E12 from 1 Mbps through profile line rate.")
+    parser.add_argument("--pps-steps", type=parse_pps_steps, default=None,
+                        help="PPS steps per active port for 64-byte tests. Default: E12 from 1,000 pps through the profile maximum PPS.")
+    parser.add_argument("--refine-step", type=float, default=_STL_DEFAULTS["refine_step"],
                         help="Optional refine step in percent between last NDR and first loss. 0 disables refine. Example: 1")
-    parser.add_argument("--single-load-percent", type=float, default=100.0,
+    parser.add_argument("--single-load-percent", type=float, default=_STL_DEFAULTS["single_load_percent"],
                         help="Used only with --no-rate-search.")
-    parser.add_argument("--lossless-threshold", type=float, default=0.0,
+    parser.add_argument("--lossless-threshold", type=float, default=_STL_DEFAULTS["lossless_threshold"],
                         help="Loss-rate threshold for NDR. Default: 0.0")
     parser.add_argument("--stop-on-first-loss", action="store_true",
                         help="Stop each coarse rate search item at first loss/error.")
+    parser.add_argument("--high-loss-threshold", type=float, default=DEFAULT_HIGH_LOSS_THRESHOLD,
+                        help="Stop threshold for consecutive packet-loss measurements. Default: 0.5 (50%%).")
+    parser.add_argument("--high-loss-consecutive", type=int, default=DEFAULT_HIGH_LOSS_CONSECUTIVE,
+                        help="Stop after this many consecutive measurements at or above --high-loss-threshold. Default: 3.")
+    parser.add_argument("--recovery-probe-interval-sec", type=float, default=DEFAULT_RECOVERY_PROBE_INTERVAL_SEC,
+                        help="Seconds between connectivity probes before every measurement. Default: 2.")
+    parser.add_argument("--recovery-success-consecutive", type=int, default=DEFAULT_RECOVERY_SUCCESS_CONSECUTIVE,
+                        help="Required consecutive successful connectivity probes before measurement. Default: 3.")
+    parser.add_argument("--recovery-timeout-sec", type=float, default=DEFAULT_RECOVERY_TIMEOUT_SEC,
+                        help="Maximum preflight recovery wait. Zero disables the timeout. Default: 300.")
     parser.add_argument("--no-install-cfg", action="store_true")
-    parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=True, help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
+    parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=_STL_DEFAULTS["auto_dpdk_bind"], help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
     parser.add_argument("--no-auto-dpdk-bind", dest="auto_dpdk_bind", action="store_false", help="Do not attempt DPDK driver binding before starting TRex. Stale benchmark namespaces are still removed.")
     parser.add_argument("--dpdk-driver", default="", help="Override the DPDK driver used for all profile PCI devices, e.g. vfio-pci or igb_uio.")
 
@@ -1900,6 +1577,7 @@ def main():
     parser.add_argument("--wan-ip", default="")
     parser.add_argument("--wan-gw", default="")
     parser.add_argument("--router-wan-ip", default="")
+    add_lan_source_port_range_argument(parser)
     parser.add_argument("--line-rate-gbps", type=float, default=None)
     parser.add_argument("--cores", type=int, default=None)
 
@@ -1916,18 +1594,43 @@ def main():
         raise SystemExit("ERROR: --refine-step must be >= 0")
     if args.test_start_delay_sec < 0:
         raise SystemExit("ERROR: --test-start-delay-sec must be >= 0")
+    if args.high_loss_threshold < 0 or args.high_loss_threshold > 1:
+        raise SystemExit("ERROR: --high-loss-threshold must be between 0 and 1")
+    if args.high_loss_consecutive <= 0:
+        raise SystemExit("ERROR: --high-loss-consecutive must be positive")
+    if args.recovery_probe_interval_sec < 0:
+        raise SystemExit("ERROR: --recovery-probe-interval-sec must be >= 0")
+    if args.recovery_success_consecutive <= 0:
+        raise SystemExit("ERROR: --recovery-success-consecutive must be positive")
+    if args.recovery_timeout_sec < 0:
+        raise SystemExit("ERROR: --recovery-timeout-sec must be >= 0")
+    if args.rate_steps is not None and (args.rate_mbps_steps is not None or args.pps_steps is not None):
+        raise SystemExit("ERROR: --rate-steps cannot be combined with --rate-mbps-steps or --pps-steps")
 
-    target = merge_target_with_overrides(TARGETS[args.target], args)
+    target = merge_target_with_overrides(
+        target_for_ip_version(TARGETS[args.target], args.ip_version),
+        args,
+    )
     if args.rate_search and args.rate_steps is None:
         if args.rate_mbps_steps is None:
             args.rate_mbps_steps = make_default_rate_mbps_steps(target["line_rate_gbps"])
         else:
             args.rate_mbps_steps = limit_rate_mbps_steps(args.rate_mbps_steps, target["line_rate_gbps"])
-    out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"trex_stl_throughput_pps_{args.target}_{ts_compact()}"
+        if args.pps_steps is None:
+            args.pps_steps = make_default_pps_steps(target["line_rate_gbps"])
+        else:
+            args.pps_steps = limit_pps_steps(args.pps_steps, target["line_rate_gbps"])
+    output_prefix = "trex_ipv6_stl_throughput_pps" if args.ip_version == "v6" else "trex_stl_throughput_pps"
+    out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"{output_prefix}_{args.target}_{ts_compact()}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    details_dir = prepare_details_dir(out_dir)
 
     print("============================================================")
-    print("TRex STL-only IPv4 NAT throughput/PPS benchmark")
+    print(
+        "TRex STL native IPv6 routing throughput/PPS benchmark"
+        if args.ip_version == "v6"
+        else "TRex STL-only IPv4 NAT throughput/PPS benchmark"
+    )
     print("============================================================")
     print(f"Target              : {args.target}")
     print(f"Description         : {target['description']}")
@@ -1938,12 +1641,17 @@ def main():
     print(f"Router WAN IP       : {target['router_wan_ip']}")
     print(f"Rate search         : {args.rate_search}")
     if args.rate_search and args.rate_steps is None:
-        print(f"Rate steps          : {[fmt_rate_value(x) for x in args.rate_mbps_steps]} Mbps")
+        print(f"Throughput steps    : {[fmt_rate_value(x) for x in args.rate_mbps_steps]} Mbps")
+        print(f"PPS steps           : {format_kpps_steps(args.pps_steps)} kpps")
     elif args.rate_search:
         print(f"Rate steps          : {args.rate_steps} %")
     else:
         print(f"Rate steps          : {[args.single_load_percent]} %")
     print(f"Refine step         : {args.refine_step}")
+    print(f"High-loss stop      : >= {args.high_loss_threshold:.1%} x {args.high_loss_consecutive}")
+    print(f"Recovery probes     : every {args.recovery_probe_interval_sec:g}s, {args.recovery_success_consecutive} consecutive successes, timeout={args.recovery_timeout_sec:g}s")
+    print(f"LAN source port     : {first_lan_source_port(args.lan_source_port_range, UDP_PORT)}"
+          f" (range {format_lan_source_port_range(args.lan_source_port_range) or 'test default'})")
     print(f"Duration/test       : {args.duration}s")
     print(f"Repeat              : {args.repeat}")
     print(f"Output              : {out_dir}")
@@ -1951,31 +1659,38 @@ def main():
 
     prepare_log = prepare_trex_interfaces_from_profile(
         target,
-        out_dir,
+        details_dir,
         auto_dpdk_bind=args.auto_dpdk_bind,
         dpdk_driver_override=args.dpdk_driver,
     )
     print(f"TRex interface prep : {prepare_log}")
 
-    install_trex_cfg(target, out_dir, args.no_install_cfg)
-    write_metadata(out_dir, args.target, target, args)
+    install_trex_cfg(target, details_dir, args.no_install_cfg)
+    write_metadata(details_dir, args.target, target, args)
 
     summaries = []
-    server = TrexStlServer(cores=int(target["trex_cores"]), out_dir=out_dir)
+    server = TrexStlServer(cores=int(target["trex_cores"]), out_dir=details_dir)
     try:
         server.start()
         summaries.extend(
             run_stl_tests(
                 target=target,
-                out_dir=out_dir,
+                out_dir=details_dir,
                 duration=args.duration,
                 repeat=args.repeat,
                 rate_search=args.rate_search,
                 rate_steps=args.rate_steps,
                 rate_mbps_steps=args.rate_mbps_steps,
+                pps_steps=args.pps_steps,
                 refine_step=args.refine_step,
                 lossless_threshold=args.lossless_threshold,
                 stop_on_first_loss=args.stop_on_first_loss,
+                high_loss_threshold=args.high_loss_threshold,
+                high_loss_consecutive=args.high_loss_consecutive,
+                recovery_probe_interval_sec=args.recovery_probe_interval_sec,
+                recovery_success_consecutive=args.recovery_success_consecutive,
+                recovery_timeout_sec=args.recovery_timeout_sec,
+                lan_source_port_range=args.lan_source_port_range,
                 single_load_percent=args.single_load_percent,
                 test_start_delay_sec=args.test_start_delay_sec,
             )
@@ -1991,10 +1706,12 @@ def main():
     print("============================================================")
     print(f"Result directory : {out_dir}")
     print(f"Summary CSV      : {summary_csv}")
-    print(f"Raw CSV          : {out_dir / 'stl_raw.csv'}")
-    print(f"Preflight CSV    : {out_dir / 'stl_preflight.csv'}")
-    print(f"Metadata         : {out_dir / 'metadata.json'}")
-    print(f"TRex server log  : {out_dir / 'trex_server_stl.log'}")
+    print(f"Details          : {details_dir}")
+    print(f"Raw CSV          : {details_dir / 'stl_raw.csv'}")
+    print(f"Preflight CSV    : {details_dir / 'stl_preflight.csv'}")
+    print(f"Recovery CSV     : {details_dir / 'stl_recovery.csv'}")
+    print(f"Metadata         : {details_dir / 'metadata.json'}")
+    print(f"TRex server log  : {details_dir / 'trex_server_stl.log'}")
 
 
 if __name__ == "__main__":

@@ -13,30 +13,46 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
-DEFAULT_RESULT_ROOT = Path(os.environ.get("TREX_RESULT_ROOT", "/var/trex"))
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    from tests.target_profiles import TARGETS  # type: ignore
+    from tests.lib.config import TARGETS  # type: ignore
+    from tests.lib.output import prepare_details_dir  # type: ignore
 except Exception:
-    from target_profiles import TARGETS  # type: ignore
+    from lib.config import TARGETS  # type: ignore
+    from lib.output import prepare_details_dir  # type: ignore
 
 try:
-    from tests.routerbench_test_start_delay import (  # type: ignore
+    from tests.lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 except Exception:
-    from routerbench_test_start_delay import (  # type: ignore
+    from lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 
 try:
-    from tests.run_router_bench_v4_astf_lib import (  # type: ignore
+    from tests.lib.common import DEFAULT_RESULT_ROOT, write_summary_csv  # type: ignore
+    from tests.lib.config import load_defaults as _load_defaults  # type: ignore
+    from tests.lib.preflight import (  # type: ignore
+        add_consecutive_preflight_arguments,
+        validate_consecutive_preflight_arguments,
+    )
+except Exception:
+    from lib.common import DEFAULT_RESULT_ROOT, write_summary_csv  # type: ignore
+    from lib.config import load_defaults as _load_defaults  # type: ignore
+    from lib.preflight import (  # type: ignore
+        add_consecutive_preflight_arguments,
+        validate_consecutive_preflight_arguments,
+    )
+
+try:
+    from tests.lib.astf import (  # type: ignore
         ASTF_TCP_PORT,
         DEFAULT_MAX_SESSIONS,
         DEFAULT_SESSION_HOLD_SEC,
@@ -59,14 +75,14 @@ try:
         require_root,
         resolve_astf_cores,
         run_astf_profile,
-        run_astf_roundtrip_preflight,
+        run_astf_roundtrip_preflight_consecutive,
         make_long_session_profile,
         ts_compact,
         ts_iso,
         try_arp,
     )
 except Exception:
-    from run_router_bench_v4_astf_lib import (  # type: ignore
+    from lib.astf import (  # type: ignore
         ASTF_TCP_PORT,
         DEFAULT_MAX_SESSIONS,
         DEFAULT_SESSION_HOLD_SEC,
@@ -89,12 +105,15 @@ except Exception:
         require_root,
         resolve_astf_cores,
         run_astf_profile,
-        run_astf_roundtrip_preflight,
+        run_astf_roundtrip_preflight_consecutive,
         make_long_session_profile,
         ts_compact,
         ts_iso,
         try_arp,
     )
+
+
+_ASTF_DEFAULTS = _load_defaults("astf")
 
 
 MAX_SESSION_TIMESERIES_FIELDS = [
@@ -409,11 +428,15 @@ def run_max_session_test(client, target, raw_writer, max_session_writer, args, r
     print(f"Total duration     : {duration:.3f}s")
     print("============================================================")
 
-    preflight = run_astf_roundtrip_preflight(
+    preflight = run_astf_roundtrip_preflight_consecutive(
         client=client,
         target=target,
         raw_writer=raw_writer,
         test_name=test_name,
+        recovery_csv=args.preflight_recovery_csv,
+        required_successes=args.preflight_success_consecutive,
+        interval_sec=args.preflight_probe_interval_sec,
+        timeout_sec=args.preflight_timeout_sec,
         tcp_port=args.astf_tcp_port,
     )
 
@@ -494,6 +517,7 @@ def run_astf_max_session_tests(target, out_dir, args):
 
     ports = [target["lan_port"], target["wan_port"]]
     raw_csv = out_dir / "astf_raw.csv"
+    args.preflight_recovery_csv = out_dir / "astf_preflight_recovery.csv"
     max_session_timeseries_csv = out_dir / "astf_max_sessions_timeseries.csv"
     summaries = []
 
@@ -539,19 +563,6 @@ def run_astf_max_session_tests(target, out_dir, args):
     return summaries
 
 
-def write_summary_csv(path, summaries):
-    keys = []
-    for row in summaries:
-        for key in row.keys():
-            if key not in keys:
-                keys.append(key)
-    with open(path, "w", newline="") as out_file:
-        writer = csv.DictWriter(out_file, fieldnames=keys)
-        writer.writeheader()
-        for row in summaries:
-            writer.writerow(row)
-
-
 def write_metadata(out_dir, target_name, target, args):
     metadata = {
         "created_at": ts_iso(),
@@ -568,12 +579,12 @@ def write_metadata(out_dir, target_name, target, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Run TRex ASTF IPv4 NAT maximum-session test.")
-    parser.add_argument("--target", choices=TARGETS.keys(), default="i226_1g")
+    parser.add_argument("--target", choices=TARGETS.keys(), default=_ASTF_DEFAULTS["target"])
     parser.add_argument("--out-dir", default="", help="Result directory. Default: /var/trex/trex_astf_max_sessions_<target>_<timestamp>/.")
-    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--repeat", type=int, default=_ASTF_DEFAULTS["repeat"])
     parser.add_argument("--test-start-delay-sec", type=float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after TRex ports report link-up and before testing. Default: 15.")
     parser.add_argument("--no-install-cfg", action="store_true")
-    parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=True, help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
+    parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=_ASTF_DEFAULTS["auto_dpdk_bind"], help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
     parser.add_argument("--no-auto-dpdk-bind", dest="auto_dpdk_bind", action="store_false", help="Do not attempt DPDK driver binding before starting TRex. Stale benchmark namespaces are still removed.")
     parser.add_argument("--dpdk-driver", default="", help="Override the DPDK driver used for all profile PCI devices, e.g. vfio-pci or igb_uio.")
 
@@ -583,12 +594,13 @@ def main():
     parser.add_argument("--stable-success-threshold", type=float, default=DEFAULT_STABLE_SUCCESS_THRESHOLD)
     parser.add_argument("--stable-loss-threshold", type=float, default=DEFAULT_STABLE_LOSS_THRESHOLD)
     parser.add_argument("--astf-tcp-port", type=int, default=ASTF_TCP_PORT)
-    parser.add_argument("--inter-test-sleep", type=float, default=5.0)
+    parser.add_argument("--inter-test-sleep", type=float, default=_ASTF_DEFAULTS["inter_test_sleep_sec"])
+    add_consecutive_preflight_arguments(parser)
     parser.add_argument("--show-progress", dest="show_progress", action="store_true", help="Show progress for long ASTF maximum-session tests. Default: enabled.")
     parser.add_argument("--no-progress", dest="show_progress", action="store_false", help="Disable ASTF maximum-session progress.")
     parser.set_defaults(show_progress=True)
-    parser.add_argument("--progress-interval", type=float, default=10.0, help="Compatibility option retained for older command lines. Progress is printed by percent step.")
-    parser.add_argument("--progress-percent-step", type=float, default=5.0, help="Progress display step in percent for the maximum-session test. Default: 5 percent.")
+    parser.add_argument("--progress-interval", type=float, default=_ASTF_DEFAULTS["progress_interval_sec"], help="Compatibility option retained for older command lines. Progress is printed by percent step.")
+    parser.add_argument("--progress-percent-step", type=float, default=_ASTF_DEFAULTS["progress_percent_step"], help="Progress display step in percent for the maximum-session test. Default: 5 percent.")
 
     parser.add_argument("--interfaces", type=parse_interfaces, default=None)
     parser.add_argument("--lan-ip", default="")
@@ -625,10 +637,12 @@ def main():
         raise SystemExit("ERROR: --progress-percent-step must be greater than 0 and less than or equal to 100")
     if args.astf_tcp_port <= 0 or args.astf_tcp_port > 65535:
         raise SystemExit("ERROR: --astf-tcp-port must be 1..65535")
+    validate_consecutive_preflight_arguments(args)
 
     target = merge_target_with_overrides(TARGETS[args.target], args)
     out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"trex_astf_max_sessions_{args.target}_{ts_compact()}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    details_dir = prepare_details_dir(out_dir)
 
     print("============================================================")
     print("TRex ASTF IPv4 NAT maximum-session benchmark")
@@ -651,20 +665,20 @@ def main():
 
     prepare_log = prepare_trex_interfaces_from_profile(
         target,
-        out_dir,
+        details_dir,
         auto_dpdk_bind=args.auto_dpdk_bind,
         dpdk_driver_override=args.dpdk_driver,
     )
     print(f"TRex interface prep : {prepare_log}")
 
-    install_trex_cfg(target, out_dir, args.no_install_cfg)
-    write_metadata(out_dir, args.target, target, args)
+    install_trex_cfg(target, details_dir, args.no_install_cfg)
+    write_metadata(details_dir, args.target, target, args)
 
     summaries = []
-    server = TrexAstfServer(cores=resolve_astf_cores(target), out_dir=out_dir)
+    server = TrexAstfServer(cores=resolve_astf_cores(target), out_dir=details_dir)
     try:
         server.start()
-        summaries.extend(run_astf_max_session_tests(target=target, out_dir=out_dir, args=args))
+        summaries.extend(run_astf_max_session_tests(target=target, out_dir=details_dir, args=args))
     finally:
         server.stop()
 
@@ -676,10 +690,11 @@ def main():
     print("============================================================")
     print(f"Result directory : {out_dir}")
     print(f"Summary CSV      : {summary_csv}")
-    print(f"Raw CSV          : {out_dir / 'astf_raw.csv'}")
-    print(f"Max session CSV  : {out_dir / 'astf_max_sessions_timeseries.csv'}")
-    print(f"Metadata         : {out_dir / 'metadata.json'}")
-    print(f"TRex server log  : {out_dir / 'trex_server_astf.log'}")
+    print(f"Details          : {details_dir}")
+    print(f"Raw CSV          : {details_dir / 'astf_raw.csv'}")
+    print(f"Max session CSV  : {details_dir / 'astf_max_sessions_timeseries.csv'}")
+    print(f"Metadata         : {details_dir / 'metadata.json'}")
+    print(f"TRex server log  : {details_dir / 'trex_server_astf.log'}")
 
 
 if __name__ == "__main__":

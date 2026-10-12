@@ -1,0 +1,70 @@
+{
+  "i226_1g_mape": {
+    "description": "Intel I226-V, 1GbE MAP-E router benchmark",
+    "benchmark_mode": "mape",
+    "line_rate_gbps": 1.0,
+    "interfaces": ["07:00.0", "08:00.0"],
+    "kernel_drivers": ["igc", "igc"],
+    "dpdk_drivers": ["auto", "auto"],
+    "lan_iface": "enp7s0",
+    "wan_iface": "enp8s0",
+    "lan_port": 0,
+    "wan_port": 1,
+
+    "lan_ip": "192.168.0.2",
+    "lan_prefix_len": 24,
+    "lan_gw": "192.168.0.1",
+
+    "wan_link_ip": "198.51.100.254",
+    "wan_prefix_len": 24,
+    "wan_gateway_ip": "198.51.100.1",
+    "wan_arp_target": "198.51.100.1",
+
+    "rule_ipv6_prefix": "2001:db8:200::/48",
+    "ce_prefix": "2001:db8:200:c03::/64",
+    "ce_wan_ia_na": "2001:db8:200:c03::100",
+    "ce_map_ipv6": null,
+    "br_ipv6": "2001:db8:ffff:ff00::1",
+
+    "rule_ipv4_prefix": "198.18.0.0/24",
+    "shared_ipv4": "198.18.0.12",
+    "ea_bits_length": 16,
+    "ipv4_suffix_length": 8,
+    "psid_offset": 4,
+    "psid_length": 8,
+    "psid": 3,
+
+    "outer_ipv6_mtu": 1500,
+    "inner_ipv4_mtu": 1460,
+    "tcp_mss": 1420,
+    "tunnel_overhead_bytes": 40,
+
+    "vpp_access_ipv6": "2001:db8:200:c03::1",
+    "vpp_ipv4": "198.51.100.1",
+    "next_hop_ipv4": "198.51.100.254",
+    "server_network": "203.0.113.0/24",
+    "server_ipv4": "203.0.113.2",
+
+    "dns_ipv6": "2001:db8:fffe::2",
+    "api_ipv6": "2001:db8:fffe::2",
+    "api_hostname": "api.enabler.ne.jp",
+
+    "supported_tests": ["mape_stl_throughput"],
+    "trex_cores": 1
+  },
+  "i226_2p5g_mape": {
+    "extends": "i226_1g_mape",
+    "description": "Intel I226-V, 2.5GbE MAP-E router benchmark",
+    "line_rate_gbps": 2.5
+  },
+  "x540_10g_mape": {
+    "extends": "i226_1g_mape",
+    "description": "Intel X540, 10GbE MAP-E router benchmark",
+    "line_rate_gbps": 10.0,
+    "interfaces": ["01:00.0", "01:00.1"],
+    "kernel_drivers": ["ixgbe", "ixgbe"],
+    "lan_iface": "enp1s0f0",
+    "wan_iface": "enp1s0f1",
+    "trex_cores": 2
+  }
+}

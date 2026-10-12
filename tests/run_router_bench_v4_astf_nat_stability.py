@@ -39,30 +39,50 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
-DEFAULT_RESULT_ROOT = Path(os.environ.get("TREX_RESULT_ROOT", "/var/trex"))
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    from tests.target_profiles import TARGETS  # type: ignore
+    from tests.lib.config import TARGETS, target_for_ip_version  # type: ignore
+    from tests.lib.output import prepare_details_dir  # type: ignore
 except Exception:
-    from target_profiles import TARGETS  # type: ignore
+    from lib.config import TARGETS, target_for_ip_version  # type: ignore
+    from lib.output import prepare_details_dir  # type: ignore
 
 try:
-    from tests.routerbench_test_start_delay import (  # type: ignore
+    from tests.lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 except Exception:
-    from routerbench_test_start_delay import (  # type: ignore
+    from lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 
 try:
-    from tests.run_router_bench_v4_astf_sessions_cps import (  # type: ignore
+    from tests.lib.common import DEFAULT_RESULT_ROOT  # type: ignore
+    from tests.lib.config import load_defaults as _load_defaults  # type: ignore
+    from tests.lib.preflight import (  # type: ignore
+        ConsecutivePreflightTimeoutError,
+        add_consecutive_preflight_arguments,
+        run_consecutive_preflight,
+        validate_consecutive_preflight_arguments,
+    )
+except Exception:
+    from lib.common import DEFAULT_RESULT_ROOT  # type: ignore
+    from lib.config import load_defaults as _load_defaults  # type: ignore
+    from lib.preflight import (  # type: ignore
+        ConsecutivePreflightTimeoutError,
+        add_consecutive_preflight_arguments,
+        run_consecutive_preflight,
+        validate_consecutive_preflight_arguments,
+    )
+
+try:
+    from tests.lib.astf import (  # type: ignore
         ASTF_TCP_PORT,
         RAW_INTERVAL_SEC,
         TrexAstfServer,
@@ -72,19 +92,22 @@ try:
         first_number,
         install_trex_cfg,
         json_cell,
+        enable_ipv6_global_info,
         make_ip_gen,
+        make_ipv6_ip_gen,
         merge_target_with_overrides,
         parse_interfaces,
         prepare_trex_interfaces_from_profile,
         require_root,
         resolve_astf_cores,
+        resolve_ipv6_gateway_macs,
         ts_compact,
         ts_iso,
         try_arp,
         write_raw_stats,
     )
 except Exception:
-    from run_router_bench_v4_astf_sessions_cps import (  # type: ignore
+    from lib.astf import (  # type: ignore
         ASTF_TCP_PORT,
         RAW_INTERVAL_SEC,
         TrexAstfServer,
@@ -94,12 +117,15 @@ except Exception:
         first_number,
         install_trex_cfg,
         json_cell,
+        enable_ipv6_global_info,
         make_ip_gen,
+        make_ipv6_ip_gen,
         merge_target_with_overrides,
         parse_interfaces,
         prepare_trex_interfaces_from_profile,
         require_root,
         resolve_astf_cores,
+        resolve_ipv6_gateway_macs,
         ts_compact,
         ts_iso,
         try_arp,
@@ -107,25 +133,34 @@ except Exception:
     )
 
 
-DEFAULT_SOAK_DURATION_SEC = 3600.0
-DEFAULT_CYCLE_CPS = 50.0
-DEFAULT_CYCLE_SESSIONS = 200
-DEFAULT_MB_PER_SESSION = 1.0
-DEFAULT_INTER_CYCLE_SLEEP_SEC = 1.0
-DEFAULT_COMPLETION_QUIET_SEC = 2.0
-DEFAULT_GENERATION_GRACE_SEC = 5.0
-DEFAULT_CONNECT_TIMEOUT_SEC = 1.0
-DEFAULT_PAYLOAD_DIRECTION = "server-to-client"
-DEFAULT_CHUNK_BYTES = 16 * 1024
-DEFAULT_UDP_MSG_PAYLOAD_BYTES = 1200
-DEFAULT_UDP_MTU = 1400
-DEFAULT_TCP_MSS = 1460
-DEFAULT_TCP_WINDOW_KB = 1024
-DEFAULT_STABLE_SUCCESS_THRESHOLD = 0.99
-DEFAULT_STABLE_LOSS_THRESHOLD = 0.001
-DEFAULT_PAYLOAD_COMPLETION_THRESHOLD = 0.999
-DEFAULT_CLIENT_PORT_MIN = 32768
-DEFAULT_CLIENT_PORT_MAX = 65535
+_NAT_DEFAULTS = _load_defaults("nat_stability")
+BENCHMARK_DESCRIPTION = "Run TRex ASTF IPv4 NAT stability soak test."
+BENCHMARK_TITLE = "TRex ASTF IPv4 NAT stability benchmark"
+DEFAULT_OUTPUT_PREFIX = "trex_astf_nat_stability"
+METADATA_MODE = "astf_nat_stability"
+STABILITY_SLUG = "astf_nat_stability"
+STABILITY_LABEL = "ASTF NAT stability"
+TCP_TG_NAME = "nat_stability_tcp"
+UDP_TG_NAME = "nat_stability_udp"
+DEFAULT_SOAK_DURATION_SEC = float(_NAT_DEFAULTS["soak_duration_sec"])
+DEFAULT_CYCLE_CPS = float(_NAT_DEFAULTS["cycle_cps"])
+DEFAULT_CYCLE_SESSIONS = int(_NAT_DEFAULTS["cycle_sessions"])
+DEFAULT_MB_PER_SESSION = float(_NAT_DEFAULTS["mb_per_session"])
+DEFAULT_INTER_CYCLE_SLEEP_SEC = float(_NAT_DEFAULTS["inter_cycle_sleep_sec"])
+DEFAULT_COMPLETION_QUIET_SEC = float(_NAT_DEFAULTS["completion_quiet_sec"])
+DEFAULT_GENERATION_GRACE_SEC = float(_NAT_DEFAULTS["generation_grace_sec"])
+DEFAULT_CONNECT_TIMEOUT_SEC = float(_NAT_DEFAULTS["connect_timeout_sec"])
+DEFAULT_PAYLOAD_DIRECTION = _NAT_DEFAULTS["payload_direction"]
+DEFAULT_CHUNK_BYTES = int(_NAT_DEFAULTS["chunk_bytes"])
+DEFAULT_UDP_MSG_PAYLOAD_BYTES = int(_NAT_DEFAULTS["udp_msg_payload_bytes"])
+DEFAULT_UDP_MTU = int(_NAT_DEFAULTS["udp_mtu"])
+DEFAULT_TCP_MSS = int(_NAT_DEFAULTS["tcp_mss"])
+DEFAULT_TCP_WINDOW_KB = int(_NAT_DEFAULTS["tcp_window_kb"])
+DEFAULT_STABLE_SUCCESS_THRESHOLD = float(_NAT_DEFAULTS["stable_success_threshold"])
+DEFAULT_STABLE_LOSS_THRESHOLD = float(_NAT_DEFAULTS["stable_loss_threshold"])
+DEFAULT_PAYLOAD_COMPLETION_THRESHOLD = float(_NAT_DEFAULTS["payload_completion_threshold"])
+DEFAULT_CLIENT_PORT_MIN = int(_NAT_DEFAULTS["client_port_min"])
+DEFAULT_CLIENT_PORT_MAX = int(_NAT_DEFAULTS["client_port_max"])
 
 CYCLE_CSV_FIELDS = [
     "ts_local_start",
@@ -299,8 +334,33 @@ def payload_marker(direction):
     return b"BIDIR-OK"
 
 
-def build_payload(size_bytes):
-    return (b"0123456789ABCDEF" * ((int(size_bytes) + 15) // 16))[:int(size_bytes)]
+def add_tcp_send_bytes(program, bytes_total, chunk_bytes):
+    """Add a bounded ASTF program that sends exactly ``bytes_total`` bytes.
+
+    ASTFProgram.send_chunk() expands a large transfer into one program command
+    per chunk and embeds the complete payload in the profile.  A 1 MB transfer
+    therefore creates dozens of commands before the preflight can even start.
+    Use TRex's virtual ``size``/``fill`` buffer with an ASTF loop instead so the
+    profile stays small regardless of the configured payload size.
+    """
+    bytes_total = int(bytes_total)
+    chunk_bytes = int(chunk_bytes)
+    if bytes_total <= 0:
+        raise ValueError("bytes_total must be positive")
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+
+    full_chunks, remainder = divmod(bytes_total, chunk_bytes)
+    fill = b"N"
+    if full_chunks == 1:
+        program.send(fill, size=chunk_bytes, fill=fill)
+    elif full_chunks > 1:
+        program.set_var("nat_payload_chunks", full_chunks)
+        program.set_label("nat_payload_chunk:")
+        program.send(fill, size=chunk_bytes, fill=fill)
+        program.jmp_nz("nat_payload_chunks", "nat_payload_chunk:")
+    if remainder:
+        program.send(fill, size=remainder, fill=fill)
 
 
 def apply_tcp_info(info, args):
@@ -317,19 +377,31 @@ def udp_packet_count(bytes_per_session, udp_msg_payload_bytes):
 
 
 def add_udp_send_messages(program, bytes_total, msg_payload_bytes):
-    remaining = int(bytes_total)
+    bytes_total = int(bytes_total)
+    msg_payload_bytes = int(msg_payload_bytes)
+    if bytes_total <= 0:
+        raise ValueError("bytes_total must be positive")
+    if msg_payload_bytes <= 0:
+        raise ValueError("msg_payload_bytes must be positive")
+
+    full_messages, remainder = divmod(bytes_total, msg_payload_bytes)
     fill = b"U"
-    while remaining > 0:
-        chunk = min(int(msg_payload_bytes), remaining)
-        program.send_msg(fill, size=int(chunk), fill=fill)
-        remaining -= chunk
+    if full_messages == 1:
+        program.send_msg(fill, size=msg_payload_bytes, fill=fill)
+    elif full_messages > 1:
+        program.set_var("nat_udp_messages", full_messages)
+        program.set_label("nat_udp_message:")
+        program.send_msg(fill, size=msg_payload_bytes, fill=fill)
+        program.jmp_nz("nat_udp_messages", "nat_udp_message:")
+    if remainder:
+        program.send_msg(fill, size=remainder, fill=fill)
 
 
 def make_tcp_nat_stability_profile(target, args, bytes_per_session):
     from trex.astf.api import ASTFGlobalInfo, ASTFProfile, ASTFProgram, ASTFTemplate, ASTFTCPClientTemplate, ASTFTCPServerTemplate
 
-    ip_gen = make_ip_gen(target)
-    payload = build_payload(bytes_per_session)
+    is_ipv6 = target.get("ip_version") == "v6"
+    ip_gen = make_ipv6_ip_gen(target) if is_ipv6 else make_ip_gen(target)
     marker = payload_marker(args.payload_direction)
 
     prog_c = ASTFProgram()
@@ -341,10 +413,10 @@ def make_tcp_nat_stability_profile(target, args, bytes_per_session):
         prog_c.wait_for_peer_close()
 
         prog_s.recv(len(marker))
-        prog_s.send_chunk(payload, int(args.payload_chunk_bytes), 0)
+        add_tcp_send_bytes(prog_s, bytes_per_session, args.payload_chunk_bytes)
 
     elif args.payload_direction == "client-to-server":
-        prog_c.send_chunk(payload, int(args.payload_chunk_bytes), 0)
+        add_tcp_send_bytes(prog_c, bytes_per_session, args.payload_chunk_bytes)
         prog_c.recv(len(marker))
         prog_c.wait_for_peer_close()
 
@@ -352,17 +424,21 @@ def make_tcp_nat_stability_profile(target, args, bytes_per_session):
         prog_s.send(marker)
 
     elif args.payload_direction == "bidirectional":
-        prog_c.send_chunk(payload, int(args.payload_chunk_bytes), 0)
+        add_tcp_send_bytes(prog_c, bytes_per_session, args.payload_chunk_bytes)
         prog_c.recv(int(bytes_per_session))
         prog_c.wait_for_peer_close()
 
         prog_s.recv(int(bytes_per_session))
-        prog_s.send_chunk(payload, int(args.payload_chunk_bytes), 0)
+        add_tcp_send_bytes(prog_s, bytes_per_session, args.payload_chunk_bytes)
     else:
         raise ValueError(f"unsupported payload direction: {args.payload_direction}")
 
-    info = ASTFGlobalInfo()
-    apply_tcp_info(info, args)
+    client_info = ASTFGlobalInfo()
+    server_info = ASTFGlobalInfo()
+    apply_tcp_info(client_info, args)
+    apply_tcp_info(server_info, args)
+    if is_ipv6:
+        enable_ipv6_global_info(client_info, server_info, target)
 
     temp_c = ASTFTCPClientTemplate(
         program=prog_c,
@@ -372,14 +448,24 @@ def make_tcp_nat_stability_profile(target, args, bytes_per_session):
         limit=int(args.cycle_sessions),
     )
     temp_s = ASTFTCPServerTemplate(program=prog_s)
-    template = ASTFTemplate(client_template=temp_c, server_template=temp_s, tg_name="nat_stability_tcp")
-    return ASTFProfile(default_ip_gen=ip_gen, templates=template, default_c_glob_info=info, default_s_glob_info=info)
+    template = ASTFTemplate(
+        client_template=temp_c,
+        server_template=temp_s,
+        tg_name=TCP_TG_NAME,
+    )
+    return ASTFProfile(
+        default_ip_gen=ip_gen,
+        templates=template,
+        default_c_glob_info=client_info,
+        default_s_glob_info=server_info,
+    )
 
 
 def make_udp_nat_stability_profile(target, args, bytes_per_session):
-    from trex.astf.api import ASTFAssociationRule, ASTFProfile, ASTFProgram, ASTFTemplate, ASTFTCPClientTemplate, ASTFTCPServerTemplate
+    from trex.astf.api import ASTFAssociationRule, ASTFGlobalInfo, ASTFProfile, ASTFProgram, ASTFTemplate, ASTFTCPClientTemplate, ASTFTCPServerTemplate
 
-    ip_gen = make_ip_gen(target)
+    is_ipv6 = target.get("ip_version") == "v6"
+    ip_gen = make_ipv6_ip_gen(target) if is_ipv6 else make_ip_gen(target)
     marker = payload_marker(args.payload_direction)
     msg_payload = int(args.udp_msg_payload_bytes)
     msg_count = udp_packet_count(bytes_per_session, msg_payload)
@@ -427,8 +513,21 @@ def make_udp_nat_stability_profile(target, args, bytes_per_session):
         program=prog_s,
         assoc=ASTFAssociationRule(port=int(args.astf_udp_port)),
     )
-    template = ASTFTemplate(client_template=temp_c, server_template=temp_s, tg_name="nat_stability_udp")
-    return ASTFProfile(default_ip_gen=ip_gen, templates=template)
+    template = ASTFTemplate(
+        client_template=temp_c,
+        server_template=temp_s,
+        tg_name=UDP_TG_NAME,
+    )
+    client_info = ASTFGlobalInfo()
+    server_info = ASTFGlobalInfo()
+    if is_ipv6:
+        enable_ipv6_global_info(client_info, server_info, target)
+    return ASTFProfile(
+        default_ip_gen=ip_gen,
+        templates=template,
+        default_c_glob_info=client_info,
+        default_s_glob_info=server_info,
+    )
 
 
 def make_nat_stability_profile(protocol, target, args, bytes_per_session):
@@ -437,6 +536,14 @@ def make_nat_stability_profile(protocol, target, args, bytes_per_session):
     if protocol == "udp":
         return make_udp_nat_stability_profile(target, args, bytes_per_session)
     raise ValueError(f"unsupported protocol: {protocol}")
+
+
+def refresh_router_neighbors(client, target):
+    ports = [target["lan_port"], target["wan_port"]]
+    if target.get("ip_version") == "v6":
+        return resolve_ipv6_gateway_macs(client, target, set_l2=True)
+    try_arp(client, ports)
+    return {}
 
 
 def tcp_payload_stats_for_direction(stats, direction, requested_sessions, bytes_per_session):
@@ -654,10 +761,10 @@ def run_one_cycle(client, profile, raw_writer, args, target, protocol, cycle_ind
     generation_sec = float(args.cycle_sessions) / float(args.cycle_cps)
     hard_timeout = calculate_cycle_hard_timeout(protocol, args, target, bytes_per_session)
     server_port = int(args.astf_tcp_port) if protocol == "tcp" else int(args.astf_udp_port)
-    test_name = f"{protocol}_cycle_{cycle_index:06d}_nat_stability_{int(args.cycle_sessions)}flow_{args.cycle_cps:g}cps_{args.mb_per_session:g}MB"
+    test_name = f"{protocol}_cycle_{cycle_index:06d}_{STABILITY_SLUG}_{int(args.cycle_sessions)}flow_{args.cycle_cps:g}cps_{args.mb_per_session:g}MB"
 
     client.reset()
-    try_arp(client, client.get_acquired_ports())
+    refresh_router_neighbors(client, target)
     client.load_profile(profile)
     client.clear_stats()
 
@@ -677,7 +784,7 @@ def run_one_cycle(client, profile, raw_writer, args, target, protocol, cycle_ind
             elapsed = now - cycle_start
             stats = client.get_stats(skip_zero=False)
             final_stats = stats
-            write_raw_stats(raw_writer, f"astf_nat_stability_{protocol}", test_name, elapsed, stats, ts_local=ts_iso())
+            write_raw_stats(raw_writer, f"{STABILITY_SLUG}_{protocol}", test_name, elapsed, stats, ts_local=ts_iso())
 
             payload_metrics = payload_stats_for_direction(
                 stats,
@@ -730,7 +837,7 @@ def run_one_cycle(client, profile, raw_writer, args, target, protocol, cycle_ind
 
     final_elapsed = time.time() - cycle_start
     final_stats = client.get_stats(skip_zero=False)
-    write_raw_stats(raw_writer, f"astf_nat_stability_{protocol}", test_name, final_elapsed, final_stats, ts_local=ts_iso())
+    write_raw_stats(raw_writer, f"{STABILITY_SLUG}_{protocol}", test_name, final_elapsed, final_stats, ts_local=ts_iso())
 
     payload_metrics = payload_stats_for_direction(
         final_stats,
@@ -827,8 +934,8 @@ def make_summary_row(cycle_rows, args, test_elapsed):
         }
 
     return {
-        "phase": "astf_nat_stability_summary",
-        "test_name": "astf_nat_stability_summary",
+        "phase": f"{STABILITY_SLUG}_summary",
+        "test_name": f"{STABILITY_SLUG}_summary",
         "protocols": ",".join(protocols),
         "soak_duration_sec_requested_per_protocol": float(args.soak_duration_sec),
         "soak_duration_sec_actual_total": test_elapsed,
@@ -884,7 +991,7 @@ def write_summary_csv(path, rows):
 
 
 def protocol_result_paths(out_dir, protocol):
-    prefix = f"astf_nat_stability_{protocol}"
+    prefix = f"{STABILITY_SLUG}_{protocol}"
     return {
         "cycles": out_dir / f"{prefix}_cycles.csv",
         "raw": out_dir / f"{prefix}_raw.csv",
@@ -917,7 +1024,7 @@ def write_metadata(out_dir, target_name, target, args, bytes_per_session):
         "target": target,
         "args": vars(args),
         "bytes_per_session": bytes_per_session,
-        "mode": "astf_nat_stability",
+        "mode": METADATA_MODE,
         "client_source_port_notice": (
             "TRex ASTF public Python profile API does not expose deterministic client source-port round-robin control; "
             "client source ports are allocated by TRex internally."
@@ -940,7 +1047,7 @@ def write_metadata(out_dir, target_name, target, args, bytes_per_session):
 
 def print_cycle_line(protocol, cycle_index, row, args, elapsed_after_cycle, remaining_after_cycle):
     print(
-        f"ASTF NAT stability proto={protocol} cycle={cycle_index} "
+        f"{STABILITY_LABEL} proto={protocol} cycle={cycle_index} "
         f"elapsed={seconds_text(elapsed_after_cycle)} remain={seconds_text(remaining_after_cycle)} "
         f"cps={float(args.cycle_cps):g} flows={int(args.cycle_sessions)} "
         f"payload={float(args.mb_per_session):g}MB timeout={float(args.connect_timeout_sec):g}s "
@@ -954,7 +1061,9 @@ def print_cycle_line(protocol, cycle_index, row, args, elapsed_after_cycle, rema
 
 
 
-def run_protocol_roundtrip_preflight(client, raw_writer, args, target, protocol, cycle_index):
+def run_protocol_roundtrip_preflight(
+    client, raw_writer, args, target, protocol, cycle_index, attempt
+):
     """Run a small protocol-matched ASTF request/reply canary before each soak cycle."""
     pre_args = argparse.Namespace(**vars(args))
     pre_args.cycle_cps = min(5.0, max(1.0, float(args.cycle_cps)))
@@ -992,8 +1101,8 @@ def run_protocol_roundtrip_preflight(client, raw_writer, args, target, protocol,
         "preflight_throughput_loss_rate": row.get("throughput_loss_rate", 0.0),
     }
     raw_writer.writerow([
-        ts_iso(), "", f"astf_nat_stability_{protocol}_preflight",
-        f"{protocol}_cycle_{cycle_index:06d}_preflight", "summary",
+        ts_iso(), "", f"{STABILITY_SLUG}_{protocol}_preflight",
+        f"{protocol}_cycle_{cycle_index:06d}_preflight_attempt{attempt}", "summary",
         json.dumps(result, ensure_ascii=False, default=str),
     ])
     if not result["preflight_ok"]:
@@ -1003,24 +1112,48 @@ def run_protocol_roundtrip_preflight(client, raw_writer, args, target, protocol,
     return result
 
 def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir, protocol, test_start, bytes_per_session):
-    profile = make_nat_stability_profile(protocol, target, args, bytes_per_session)
     protocol_start = time.time()
     rows = []
     cycle_index = 1
     preflight_elapsed_total = 0.0
+    preflight = None
     while True:
+        preflight_timed_out = False
+        preflight_failed = False
         elapsed_total = time.time() - protocol_start - preflight_elapsed_total
         if elapsed_total >= float(args.soak_duration_sec):
             break
         try:
-            preflight_started = time.time()
-            try:
-                preflight = run_protocol_roundtrip_preflight(
-                    client=client, raw_writer=raw_writer, args=args, target=target,
-                    protocol=protocol, cycle_index=cycle_index,
-                )
-            finally:
-                preflight_elapsed_total += time.time() - preflight_started
+            if preflight is None:
+                preflight_started = time.time()
+                try:
+                    outcome = run_consecutive_preflight(
+                        lambda attempt: run_protocol_roundtrip_preflight(
+                            client=client,
+                            raw_writer=raw_writer,
+                            args=args,
+                            target=target,
+                            protocol=protocol,
+                            cycle_index=cycle_index,
+                            attempt=attempt,
+                        ),
+                        phase=f"{protocol}_protocol_start",
+                        csv_path=out_dir / "astf_preflight_recovery.csv",
+                        required_successes=args.preflight_success_consecutive,
+                        interval_sec=args.preflight_probe_interval_sec,
+                        timeout_sec=args.preflight_timeout_sec,
+                    )
+                    preflight = dict(outcome.value)
+                    preflight.update({
+                        "preflight_attempts": outcome.attempts,
+                        "preflight_consecutive_successes": outcome.consecutive_successes,
+                        "preflight_recovery_elapsed_sec": outcome.elapsed_sec,
+                    })
+                finally:
+                    preflight_elapsed_total += time.time() - preflight_started
+            profile = make_nat_stability_profile(
+                protocol, target, args, bytes_per_session
+            )
             row = run_one_cycle(
                 client=client,
                 profile=profile,
@@ -1034,13 +1167,17 @@ def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir,
                 bytes_per_session=bytes_per_session,
             )
             row.update(preflight)
-        except Exception:
+        except Exception as exc:
+            preflight_timed_out = isinstance(
+                exc, ConsecutivePreflightTimeoutError
+            )
+            preflight_failed = preflight is None
             row = {
                 "ts_local_start": ts_iso(),
                 "ts_local_end": ts_iso(),
                 "cycle_index": cycle_index,
                 "protocol": protocol,
-                "test_name": f"{protocol}_cycle_{cycle_index:06d}_nat_stability_error",
+                "test_name": f"{protocol}_cycle_{cycle_index:06d}_{STABILITY_SLUG}_error",
                 "test_elapsed_total_sec": time.time() - test_start,
                 "protocol_elapsed_sec": time.time() - protocol_start - preflight_elapsed_total,
                 "completion_reason": "exception",
@@ -1063,11 +1200,14 @@ def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir,
 
         rows.append(row)
         cycle_writer.writerow({field: row.get(field, "") for field in CYCLE_CSV_FIELDS})
-        raw_writer.writerow([ts_iso(), "", f"astf_nat_stability_{protocol}", row.get("test_name", ""), "cycle_summary", json.dumps(row, ensure_ascii=False, default=str)])
+        raw_writer.writerow([ts_iso(), "", f"{STABILITY_SLUG}_{protocol}", row.get("test_name", ""), "cycle_summary", json.dumps(row, ensure_ascii=False, default=str)])
 
         elapsed_after_cycle = time.time() - protocol_start - preflight_elapsed_total
         remaining_after_cycle = max(0.0, float(args.soak_duration_sec) - elapsed_after_cycle)
         print_cycle_line(protocol, cycle_index, row, args, elapsed_after_cycle, remaining_after_cycle)
+
+        if preflight_timed_out or preflight_failed:
+            break
 
         cycle_index += 1
         if elapsed_after_cycle >= float(args.soak_duration_sec):
@@ -1093,13 +1233,13 @@ def run_nat_stability_test(target, out_dir, args):
     client.connect()
     try:
         client.reset()
-        try_arp(client, ports)
-        wait_before_test_start(args.test_start_delay_sec, "ASTF NAT stability benchmark")
+        refresh_router_neighbors(client, target)
+        wait_before_test_start(args.test_start_delay_sec, f"{STABILITY_LABEL} benchmark")
         test_start = time.time()
 
         for protocol in args.protocols:
             paths = protocol_result_paths(out_dir, protocol)
-            print(f"--- ASTF NAT stability protocol={protocol} start ---", flush=True)
+            print(f"--- {STABILITY_LABEL} protocol={protocol} start ---", flush=True)
             with open(paths["raw"], "w", newline="") as raw_file, open(paths["cycles"], "w", newline="") as cycle_file:
                 raw_writer = csv.writer(raw_file)
                 write_raw_header(raw_writer)
@@ -1126,7 +1266,7 @@ def run_nat_stability_test(target, out_dir, args):
                 "paths": paths,
                 "summary_row": make_summary_row(protocol_rows, args, protocol_elapsed_from_rows(protocol_rows)),
             }
-            print(f"--- ASTF NAT stability protocol={protocol} end cycles={len(protocol_rows)} ---", flush=True)
+            print(f"--- {STABILITY_LABEL} protocol={protocol} end cycles={len(protocol_rows)} ---", flush=True)
     finally:
         try:
             client.stop()
@@ -1143,8 +1283,9 @@ def run_nat_stability_test(target, out_dir, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run TRex ASTF IPv4 NAT stability soak test.")
-    parser.add_argument("--target", choices=TARGETS.keys(), default="i226_2p5g")
+    parser = argparse.ArgumentParser(description=BENCHMARK_DESCRIPTION)
+    parser.add_argument("--ip-version", choices=("v4", "v6"), default="v4", help=argparse.SUPPRESS)
+    parser.add_argument("--target", choices=TARGETS.keys(), default=_NAT_DEFAULTS["target"])
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--test-start-delay-sec", type=parse_non_negative_float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after TRex ports report link-up and before testing. Default: 15.")
     parser.add_argument("--soak-duration-sec",
@@ -1167,16 +1308,17 @@ def main():
                         help="L7 payload direction. Default: server-to-client.")
     parser.add_argument("--inter-cycle-sleep-sec", type=parse_non_negative_float, default=DEFAULT_INTER_CYCLE_SLEEP_SEC,
                         help="Sleep after a cycle has finished. Default: 1 second.")
-    parser.add_argument("--cycle-hard-timeout-sec", type=parse_non_negative_float, default=0.0,
+    add_consecutive_preflight_arguments(parser)
+    parser.add_argument("--cycle-hard-timeout-sec", type=parse_non_negative_float, default=_NAT_DEFAULTS["cycle_hard_timeout_sec"],
                         help="Maximum seconds per cycle. 0 means auto based on target line rate.")
     parser.add_argument("--connect-timeout-sec", "--establish-timeout-sec", dest="connect_timeout_sec",
                         type=parse_non_negative_float, default=DEFAULT_CONNECT_TIMEOUT_SEC,
                         help="Maximum seconds to wait for one TCP flow to be established. Passed to ASTFClient.start(e_duration=...). Default: 1 second. 0 disables this TRex-side establish timeout.")
-    parser.add_argument("--teardown-timeout-sec", type=parse_non_negative_float, default=5.0)
+    parser.add_argument("--teardown-timeout-sec", type=parse_non_negative_float, default=_NAT_DEFAULTS["teardown_timeout_sec"])
     parser.add_argument("--generation-grace-sec", type=parse_non_negative_float, default=DEFAULT_GENERATION_GRACE_SEC)
     parser.add_argument("--completion-quiet-sec", type=parse_non_negative_float, default=DEFAULT_COMPLETION_QUIET_SEC,
                         help="Seconds with no payload progress before a drained-but-short cycle is considered complete.")
-    parser.add_argument("--active-flow-complete-threshold", type=parse_non_negative_float, default=0.0)
+    parser.add_argument("--active-flow-complete-threshold", type=parse_non_negative_float, default=_NAT_DEFAULTS["active_flow_complete_threshold"])
     parser.add_argument("--sample-interval-sec", type=parse_positive_float, default=RAW_INTERVAL_SEC)
     parser.add_argument("--stable-success-threshold", type=float, default=DEFAULT_STABLE_SUCCESS_THRESHOLD)
     parser.add_argument("--stable-loss-threshold", type=float, default=DEFAULT_STABLE_LOSS_THRESHOLD)
@@ -1195,13 +1337,13 @@ def main():
     parser.add_argument("--client-port-max", type=int, default=DEFAULT_CLIENT_PORT_MAX,
                         help="Requested client source-port upper bound recorded in metadata. Public ASTF API does not force this value.")
     parser.add_argument("--no-install-cfg", action="store_true")
-    parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=True, help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
+    parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=_NAT_DEFAULTS["auto_dpdk_bind"], help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
     parser.add_argument("--no-auto-dpdk-bind", dest="auto_dpdk_bind", action="store_false", help="Do not attempt DPDK driver binding before starting TRex. Stale benchmark namespaces are still removed.")
     parser.add_argument("--dpdk-driver", default="", help="Override the DPDK driver used for all profile PCI devices, e.g. vfio-pci or igb_uio.")
-    parser.add_argument("--show-progress", dest="show_progress", action="store_true", help="Accepted for compatibility; NAT stability does not print progress bars.")
+    parser.add_argument("--show-progress", dest="show_progress", action="store_true", help="Accepted for compatibility; stability does not print progress bars.")
     parser.add_argument("--no-progress", dest="show_progress", action="store_false")
     parser.set_defaults(show_progress=False)
-    parser.add_argument("--progress-percent-step", type=parse_positive_float, default=5.0)
+    parser.add_argument("--progress-percent-step", type=parse_positive_float, default=_NAT_DEFAULTS["progress_percent_step"])
 
     parser.add_argument("--interfaces", type=parse_interfaces, default=None)
     parser.add_argument("--lan-ip", default="")
@@ -1213,8 +1355,10 @@ def main():
     parser.add_argument("--cores", type=int, default=None)
 
     args, unknown_args = parser.parse_known_args()
+    if any(argument == "--repeat" or argument.startswith("--repeat=") for argument in unknown_args):
+        raise SystemExit(f"ERROR: --repeat is not supported by the {STABILITY_LABEL} benchmark")
     if unknown_args:
-        print(f"WARNING: ignored unsupported options for ASTF NAT stability script: {' '.join(unknown_args)}")
+        print(f"WARNING: ignored unsupported options for {STABILITY_LABEL} script: {' '.join(unknown_args)}")
 
     update_payload_size_args(args)
 
@@ -1240,16 +1384,21 @@ def main():
         raise SystemExit("ERROR: --payload-completion-threshold must be 0..1")
     if args.progress_percent_step <= 0 or args.progress_percent_step > 100:
         raise SystemExit("ERROR: --progress-percent-step must be greater than 0 and less than or equal to 100")
+    validate_consecutive_preflight_arguments(args)
 
-    target = merge_target_with_overrides(TARGETS[args.target], args)
-    out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"trex_astf_nat_stability_{args.target}_{ts_compact()}"
+    target = merge_target_with_overrides(
+        target_for_ip_version(TARGETS[args.target], args.ip_version),
+        args,
+    )
+    out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"{DEFAULT_OUTPUT_PREFIX}_{args.target}_{ts_compact()}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    details_dir = prepare_details_dir(out_dir)
     bytes_per_session = resolve_bytes_per_session(args)
     tcp_cycle_hard_timeout = calculate_cycle_hard_timeout("tcp", args, target, bytes_per_session)
     udp_cycle_hard_timeout = calculate_cycle_hard_timeout("udp", args, target, bytes_per_session)
 
     print("============================================================")
-    print("TRex ASTF IPv4 NAT stability benchmark")
+    print(BENCHMARK_TITLE)
     print("============================================================")
     print(f"Target              : {args.target}")
     print(f"Description         : {target['description']}")
@@ -1278,19 +1427,25 @@ def main():
 
     prepare_log = prepare_trex_interfaces_from_profile(
         target,
-        out_dir,
+        details_dir,
         auto_dpdk_bind=args.auto_dpdk_bind,
         dpdk_driver_override=args.dpdk_driver,
     )
     print(f"TRex interface prep : {prepare_log}")
 
-    install_trex_cfg(target, out_dir, args.no_install_cfg)
-    write_metadata(out_dir, args.target, target, args, bytes_per_session)
+    install_trex_cfg(target, details_dir, args.no_install_cfg)
+    write_metadata(details_dir, args.target, target, args, bytes_per_session)
 
-    server = TrexAstfServer(cores=resolve_astf_cores(target), out_dir=out_dir)
+    server = TrexAstfServer(cores=resolve_astf_cores(target), out_dir=details_dir)
     try:
-        server.start()
-        cycle_rows, summary_row, protocol_results = run_nat_stability_test(target=target, out_dir=out_dir, args=args)
+        try:
+            server.start()
+            cycle_rows, summary_row, protocol_results = run_nat_stability_test(target=target, out_dir=details_dir, args=args)
+        except BaseException:
+            (details_dir / "astf_nat_stability_runner_error.log").write_text(
+                traceback.format_exc(), encoding="utf-8"
+            )
+            raise
     finally:
         server.stop()
 
@@ -1311,13 +1466,14 @@ def main():
     print(f"Cycles attempted : {summary_row.get('cycles_attempted')}")
     print(f"Cycles unstable  : {summary_row.get('cycles_unstable')}")
     print(f"Summary CSV      : {summary_csv}")
+    print(f"Details          : {details_dir}")
     for protocol in args.protocols:
-        paths = protocol_result_paths(out_dir, protocol)
+        paths = protocol_result_paths(details_dir, protocol)
         print(f"{protocol.upper()} summary CSV : {paths['summary']}")
         print(f"{protocol.upper()} cycle CSV   : {paths['cycles']}")
         print(f"{protocol.upper()} raw CSV     : {paths['raw']}")
-    print(f"Metadata         : {out_dir / 'metadata.json'}")
-    print(f"TRex server log  : {out_dir / 'trex_server_astf.log'}")
+    print(f"Metadata         : {details_dir / 'metadata.json'}")
+    print(f"TRex server log  : {details_dir / 'trex_server_astf.log'}")
 
 
 if __name__ == "__main__":

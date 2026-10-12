@@ -4,10 +4,12 @@
 # Basic speed test launcher.
 #
 # Execution policy:
-#   --run-all              : run the standard full set, including ASTF short-session CPS,
-#                            NAT stability, delayed DNS table pass, and sustained DNS load.
+#   --run-all              : run the standard full set, including native IPv6
+#                            routing stability, but excluding IPv4 NAT stability
+#                            and DNS stability.
 #   no --run-* option      : run the default set, including TCP scratch max-session test
-#                            and ASTF short-session CPS, but excluding NAT stability.
+#                            and ASTF short-session CPS, but excluding NAT stability
+#                            and DNS stability.
 #   one or more --run-*    : run only the specified tests, in TEST_PLAN order.
 #   legacy TRex ASTF max-session test runs only through its dedicated selector.
 #
@@ -30,85 +32,28 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TESTS_DIR = SCRIPT_DIR / "tests"
-DEFAULT_RESULT_ROOT = Path(os.environ.get("TREX_RESULT_ROOT", "/var/trex"))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from tests.target_profiles import TARGETS  # type: ignore
+from tests.lib.config import TARGETS  # type: ignore
+from tests.lib.common import DEFAULT_RESULT_ROOT, ts_compact  # type: ignore
+from tests.lib.config import load_defaults as _load_defaults  # type: ignore
+from tests.lib.repeat import DEFAULT_REPEAT, argparse_repeat  # type: ignore
+from tests.lib.output import prepare_details_dir  # type: ignore
+from tests.lib.source_ports import (  # type: ignore
+    add_lan_source_port_range_argument,
+    format_lan_source_port_range,
+)
 
-TEST_PLAN = [
-    {
-        "key": "stl_throughput",
-        "run_arg": "run_stl_throughput",
-        "name": "IPv4 STL throughput/PPS",
-        "script": TESTS_DIR / "run_router_bench_v4_stl_throughput_pps.py",
-        "out_dir_name": "01_stl_throughput_pps",
-        "default": True,
-    },
-    {
-        "key": "tcp_scratch_max_sessions",
-        "run_arg": "run_tcp_scratch_max_sessions",
-        "name": "IPv4 TCP scratch max sessions",
-        "script": TESTS_DIR / "run_router_bench_v4_tcp_scratch_max_sessions.py",
-        "out_dir_name": "02_tcp_scratch_max_sessions",
-        "default": True,
-        "run_all": True,
-    },
-    {
-        "key": "astf_max_sessions",
-        "run_arg": "run_astf_max_sessions",
-        "name": "IPv4 ASTF max sessions (legacy TRex)",
-        "script": TESTS_DIR / "run_router_bench_v4_astf_max_sessions.py",
-        "out_dir_name": "02_astf_max_sessions_legacy",
-        "default": False,
-        "run_all": False,
-    },
-    {
-        "key": "astf_sessions_cps",
-        "run_arg": "run_astf_sessions_cps",
-        "name": "IPv4 ASTF short-session CPS",
-        "script": TESTS_DIR / "run_router_bench_v4_astf_sessions_cps.py",
-        "out_dir_name": "03_astf_sessions_cps",
-        "default": True,
-        "run_all": True,
-    },
-    {
-        "key": "astf_nat",
-        "run_arg": "run_astf_natstability",
-        "name": "IPv4 ASTF NAT stability soak",
-        "script": TESTS_DIR / "run_router_bench_v4_astf_nat_stability.py",
-        "out_dir_name": "04_astf_nat_stability",
-        # Long soak test. Excluded from the no-option default set.
-        "default": False,
-    },
-    {
-        "key": "l4_latency",
-        "run_arg": "run_l4_latency",
-        "name": "IPv4 TCP/UDP request-response latency 0/10/20/30/40/50/60/70/80/90/95/99%",
-        "script": TESTS_DIR / "run_router_bench_v4_iperf3_latency.py",
-        "out_dir_name": "05_iperf3_l4rr_latency",
-        # This script performs post-TRex kernel/netns preparation internally.
-        "default": True,
-    },
-    {
-        "key": "dns_latency",
-        "run_arg": "run_dns_latency",
-        "name": "IPv4 DNS rate/cache/table benchmark",
-        "script": TESTS_DIR / "run_router_bench_v4_dns_latency.py",
-        "out_dir_name": "06_dns_forwarder_cache_latency",
-        # This script performs post-TRex kernel/netns preparation internally.
-        "default": True,
-    },
-    {
-        "key": "dhcp_scratch",
-        "run_arg": "run_dhcp_scratch",
-        "name": "IPv4 DHCPv4 basic latency using scratch raw socket",
-        "script": TESTS_DIR / "run_router_bench_v4_dhcp_scratch.py",
-        "out_dir_name": "07_dhcp_scratch_lease_acquisition",
-        # Basic DHCP DORA latency is part of the no-option default set.
-        "default": True,
-    },
-]
+
+_LAUNCHER_DEFAULTS = _load_defaults("launcher")
+_RECOVERY_DEFAULTS = _load_defaults("recovery")
+RECOVERY_SCRIPT = TESTS_DIR / "run_router_bench_recovery_check.py"
+TEST_PLAN = []
+for configured_test in _LAUNCHER_DEFAULTS["test_plan"]:
+    test = dict(configured_test)
+    test["script"] = TESTS_DIR / test["script"]
+    TEST_PLAN.append(test)
 
 RUN_SELECTOR_OPTIONS = {
     "--run-all",
@@ -117,8 +62,10 @@ RUN_SELECTOR_OPTIONS = {
     "--run-astf-max-sessions",
     "--run-astf-sessions-cps",
     "--run-astf-natstability",
+    "--run-ipv6-stability",
     "--run-l4-latency",
     "--run-dns-latency",
+    "--run-dns-stability",
     "--run-dns-all",
     "--run-dns-load",
     "--run-dhcp-scratch",
@@ -130,8 +77,13 @@ LAUNCHER_OPTIONS = {
     "--target",
     "--out-dir",
     "--dry-run",
+    "--repeat",
+    "--ip-version",
     "--test-start-delay-sec",
     "--soak-duration-sec",
+    "--inter-test-probe-interval-sec",
+    "--inter-test-success-consecutive",
+    "--lan-source-port-range",
     *RUN_SELECTOR_OPTIONS,
 }
 
@@ -145,10 +97,6 @@ DEPRECATED_LAUNCHER_OPTIONS = {
     "--run-astf-nat",
     "--run-iperf3-latency",
 }
-
-
-def ts_compact():
-    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def build_default_out_dir(target):
@@ -166,13 +114,26 @@ def ensure_dir(path):
         ) from exc
 
 
-def write_launcher_metadata(parent_out_dir, target, enabled_tests, passthrough_args, dry_run, selection_mode, test_start_delay_sec):
+def write_launcher_metadata(parent_out_dir, target, ip_version, enabled_tests, passthrough_args, dry_run, selection_mode, test_start_delay_sec, repeat, inter_test_probe_interval_sec, inter_test_success_consecutive, lan_source_port_range):
     metadata = {
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
         "target": target,
+        "ip_version": ip_version,
         "dry_run": bool(dry_run),
         "selection_mode": selection_mode,
+        "repeat": int(repeat),
         "test_start_delay_sec": float(test_start_delay_sec),
+        "failure_policy": {
+            "continue_after_test_failure": True,
+            "continue_after_recovery_failure": True,
+            "final_exit_code_nonzero_on_any_failure": True,
+        },
+        "inter_test_recovery": {
+            "probe_interval_sec": float(inter_test_probe_interval_sec),
+            "required_consecutive_successes": int(inter_test_success_consecutive),
+            "output": "details/inter_test_recovery.csv",
+        },
+        "lan_source_port_range": format_lan_source_port_range(lan_source_port_range),
         "passthrough_args": list(passthrough_args),
         "tests": [
             {
@@ -184,7 +145,8 @@ def write_launcher_metadata(parent_out_dir, target, enabled_tests, passthrough_a
             for item in enabled_tests
         ],
     }
-    (parent_out_dir / "launcher_metadata.json").write_text(
+    details_dir = prepare_details_dir(parent_out_dir)
+    (details_dir / "launcher_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
@@ -246,8 +208,16 @@ def filter_passthrough_args(script, passthrough_args):
 
 
 def select_tests(args):
+    selected_families = {"v4", "v6"} if args.ip_version == "dual" else {args.ip_version}
+
+    def family_enabled(item):
+        return bool(selected_families.intersection(item.get("families", ("v4", "v6"))))
+
     if args.run_all:
-        return [item for item in TEST_PLAN if item.get("run_all", True)], "run_all"
+        return [
+            item for item in TEST_PLAN
+            if family_enabled(item) and item.get("run_all", True)
+        ], "run_all"
 
     explicit_keys = {
         item["key"]
@@ -255,15 +225,21 @@ def select_tests(args):
         if bool(getattr(args, item["run_arg"], False))
     }
     if getattr(args, "run_dns_all", False):
-        explicit_keys.add("dns_latency")
+        explicit_keys.update({"dns_latency", "dns_stability"})
     if getattr(args, "run_dns_load", False):
-        explicit_keys.add("dns_latency")
+        explicit_keys.add("dns_stability")
     if getattr(args, "run_dhcp_scratch", False) or getattr(args, "run_dhcp_emu", False):
         explicit_keys.add("dhcp_scratch")
     if explicit_keys:
-        return [item for item in TEST_PLAN if item["key"] in explicit_keys], "explicit"
+        return [
+            item for item in TEST_PLAN
+            if family_enabled(item) and item["key"] in explicit_keys
+        ], "explicit"
 
-    return [item for item in TEST_PLAN if item.get("default", False)], "default"
+    return [
+        item for item in TEST_PLAN
+        if family_enabled(item) and item.get("default", False)
+    ], "default"
 
 
 def enforce_target_supported_tests(target_name, enabled_tests, selection_mode):
@@ -276,6 +252,8 @@ def enforce_target_supported_tests(target_name, enabled_tests, selection_mode):
         supported_set.update({"tcp_scratch_max_sessions", "astf_max_sessions", "astf_sessions_cps"})
     if "max_sessions" in supported_set:
         supported_set.add("tcp_scratch_max_sessions")
+    if "l4_latency" in supported_set:
+        supported_set.add("ipv6_l4_latency")
     unsupported = [item for item in enabled_tests if item["key"] not in supported_set]
     if unsupported:
         unsupported_names = ", ".join(item["key"] for item in unsupported)
@@ -293,7 +271,7 @@ def enforce_target_supported_tests(target_name, enabled_tests, selection_mode):
 def _launcher_selector_help():
     return (
         "Use --run-all, no --run-* option, or one or more of "
-        "--run-stl-throughput / --run-tcp-scratch-max-sessions / --run-astf-max-sessions / --run-astf-sessions-cps / --run-astf-natstability / --run-l4-latency / --run-dns-latency / --run-dns-all / --run-dns-load / --run-dhcp-scratch."
+        "--run-stl-throughput / --run-tcp-scratch-max-sessions / --run-astf-max-sessions / --run-astf-sessions-cps / --run-astf-natstability / --run-ipv6-stability / --run-l4-latency / --run-dns-latency / --run-dns-stability / --run-dns-all / --run-dns-load / --run-dhcp-scratch."
     )
 
 
@@ -437,10 +415,10 @@ def validate_launcher_option_combination(args, enabled_tests):
         )
 
     enabled_keys = {item["key"] for item in enabled_tests}
-    if args.soak_duration_sec is not None and "astf_nat" not in enabled_keys:
+    if args.soak_duration_sec is not None and not enabled_keys.intersection({"astf_nat", "ipv6_stability"}):
         raise SystemExit(
-            "ERROR: --soak-duration-sec is valid only when ASTF NAT stability is selected "
-            "(--run-astf-natstability or --run-all).\nNo benchmark was started."
+            "ERROR: --soak-duration-sec is valid only when a long-duration stability test "
+            "is selected.\nNo benchmark was started."
         )
 
 
@@ -451,20 +429,29 @@ def main():
         allow_abbrev=False,
     )
 
-    parser.add_argument("--target", choices=TARGETS.keys(), default="i226_2p5g",
+    parser.add_argument("--target", choices=TARGETS.keys(), default=_LAUNCHER_DEFAULTS["target"],
                         help="Target profile passed to child tests.")
+    parser.add_argument("--ip-version", choices=("v4", "v6", "dual"), default="dual",
+                        help="Address family to measure. Default: dual (IPv4 and native IPv6).")
     parser.add_argument("--out-dir", default="",
                         help="Parent result directory. Default: /var/trex/trex_basic_speed_<target>_<timestamp>/. A child directory is created for each test.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without executing them.")
-    parser.add_argument("--test-start-delay-sec", type=float, default=15.0,
+    parser.add_argument("--repeat", type=argparse_repeat, default=DEFAULT_REPEAT,
+                        help="Repeat each supported benchmark. ASTF NAT stability and DNS stability do not use this option. Default: 1.")
+    parser.add_argument("--test-start-delay-sec", type=float, default=_load_defaults("common")["test_start_delay_sec"],
                         help="Seconds each child test waits after link-up before sending benchmark traffic. Default: 15.")
+    parser.add_argument("--inter-test-probe-interval-sec", type=float, default=_RECOVERY_DEFAULTS["probe_interval_sec"],
+                        help="Seconds between TCP recovery probes before the next selected test. Default: 2.")
+    parser.add_argument("--inter-test-success-consecutive", type=int, default=_RECOVERY_DEFAULTS["success_consecutive"],
+                        help="Required consecutive successful TCP probes before the next selected test. Default: 3.")
+    add_lan_source_port_range_argument(parser)
 
     selection = parser.add_argument_group("test selection")
     selection.add_argument("--run-all", action="store_true",
-                           help="Run the standard full set, including ASTF short-session CPS and ASTF NAT stability.")
+                           help="Run the full set. Native IPv6 routing stability is included; IPv4 NAT stability and DNS stability remain excluded.")
     selection.add_argument("--run-stl-throughput", action="store_true",
-                           help="Run only/add IPv4 STL throughput/PPS when any individual --run-* option is used.")
+                           help="Run only/add STL throughput/PPS for the selected address family.")
     selection.add_argument("--run-tcp-scratch-max-sessions", action="store_true",
                            help="Run only/add IPv4 TCP scratch max-session test when any individual --run-* option is used.")
     selection.add_argument("--run-astf-max-sessions", action="store_true",
@@ -473,28 +460,41 @@ def main():
                            help="Run only/add IPv4 ASTF short-session CPS test. This is included in the default set and --run-all.")
     selection.add_argument("--run-astf-natstability", action="store_true",
                            help="Run only/add IPv4 ASTF NAT stability soak when any individual --run-* option is used.")
+    selection.add_argument("--run-ipv6-stability", action="store_true",
+                           help="Run only/add native IPv6 routing stability soak.")
     selection.add_argument("--run-l4-latency", action="store_true",
-                           help="Run only/add IPv4 TCP/UDP request-response latency 0/10/20/30/40/50/60/70/80/90/95/99%% when any individual --run-* option is used.")
+                           help="Run only/add TCP/UDP request-response latency for the selected address family.")
     selection.add_argument("--run-dns-latency", action="store_true",
-                           help="Run only/add IPv4 DNS forwarder/cache latency and cache retention without the delayed 600-second table pass.")
+                           help="Run only/add IPv4 DNS cache-table size, cached response, and uncached response benchmark.")
+    selection.add_argument("--run-dns-stability", action="store_true",
+                           help="Run only/add IPv4 DNS stability benchmark at a fixed --dns-stability-qps. This is excluded from the default set and --run-all.")
     selection.add_argument("--run-dns-all", action="store_true",
-                           help="Run IPv4 DNS benchmark including the delayed table-size pass after --dns-table-reuse-interval-sec. This selects only DNS unless combined with other individual selectors.")
+                           help="Run both IPv4 DNS response and DNS stability scripts. This selects only DNS unless combined with other individual selectors.")
     selection.add_argument("--run-dns-load", action="store_true",
-                           help="Run IPv4 DNS nocache_rate followed by a sustained nocache DNS load. This selects only DNS unless combined with other individual selectors.")
+                           help="Compatibility alias for --run-dns-stability.")
     selection.add_argument("--run-dhcp-scratch", action="store_true",
                            help="Run only/add IPv4 DHCPv4 basic latency using the scratch raw-socket DHCP client.")
     selection.add_argument("--run-dhcp-emu", action="store_true", help=argparse.SUPPRESS)
 
     parser.add_argument("--soak-duration-sec", type=float, default=None,
-                        help="IPv4 ASTF NAT stability soak duration in seconds. Default: child script default, 3600 seconds. This is forwarded only to the NAT stability soak test.")
+                        help="Long-duration stability test duration in seconds. Default: child script default, 3600 seconds.")
 
     args, passthrough_args = parser.parse_known_args()
     reject_invalid_launcher_options(passthrough_args)
 
     if args.test_start_delay_sec < 0:
         raise SystemExit("ERROR: --test-start-delay-sec must be >= 0")
+    if args.inter_test_probe_interval_sec < 0:
+        raise SystemExit("ERROR: --inter-test-probe-interval-sec must be >= 0")
+    if args.inter_test_success_consecutive <= 0:
+        raise SystemExit("ERROR: --inter-test-success-consecutive must be positive")
 
     enabled_tests, selection_mode = select_tests(args)
+    if selection_mode == "explicit" and not enabled_tests:
+        raise SystemExit(
+            f"ERROR: the selected test(s) do not support --ip-version {args.ip_version}.\n"
+            "No benchmark was started."
+        )
     validate_launcher_option_combination(args, enabled_tests)
     validate_passthrough_args(passthrough_args, enabled_tests)
     enforce_target_supported_tests(args.target, enabled_tests, selection_mode)
@@ -507,20 +507,28 @@ def main():
     print("Router benchmark launcher")
     print("============================================================")
     print(f"Target         : {args.target}")
+    print(f"IP version     : {args.ip_version}")
     print(f"Selection mode : {selection_mode}")
     print(f"Parent out dir : {parent_out_dir}")
     print(f"Start delay    : {args.test_start_delay_sec:g}s after link-up per test")
+    print(f"Repeat         : {args.repeat}")
+    print(f"LAN source port: {format_lan_source_port_range(args.lan_source_port_range) or '(test default)'}")
     print(f"Passthrough    : {' '.join(passthrough_args) if passthrough_args else '(none)'}")
 
     if not args.dry_run:
         write_launcher_metadata(
             parent_out_dir=parent_out_dir,
             target=args.target,
+            ip_version=args.ip_version,
             enabled_tests=enabled_tests,
             passthrough_args=passthrough_args,
             dry_run=args.dry_run,
             selection_mode=selection_mode,
             test_start_delay_sec=args.test_start_delay_sec,
+            repeat=args.repeat,
+            inter_test_probe_interval_sec=args.inter_test_probe_interval_sec,
+            inter_test_success_consecutive=args.inter_test_success_consecutive,
+            lan_source_port_range=args.lan_source_port_range,
         )
 
     if enabled_tests:
@@ -532,10 +540,11 @@ def main():
     if args.dry_run:
         print("Launcher meta  : not written in dry-run mode")
     else:
-        print(f"Launcher meta  : {parent_out_dir / 'launcher_metadata.json'}")
+        print(f"Launcher meta  : {parent_out_dir / 'details' / 'launcher_metadata.json'}")
     print("============================================================")
 
     failed = []
+    previous_item = None
 
     for item in enabled_tests:
         script = item["script"]
@@ -547,22 +556,48 @@ def main():
             failed.append((name, "script not found"))
             continue
 
+        if previous_item is not None:
+            families = item.get("families", ["v4"])
+            recovery_ip_version = "v6" if families == ["v6"] else "v4"
+            recovery_cmd = [
+                sys.executable,
+                str(RECOVERY_SCRIPT),
+                "--mode", "basic",
+                "--target", args.target,
+                "--ip-version", recovery_ip_version,
+                "--out-dir", str(parent_out_dir / "details"),
+                "--previous-test", previous_item["name"],
+                "--next-test", item["name"],
+                "--probe-interval-sec", str(args.inter_test_probe_interval_sec),
+                "--success-consecutive", str(args.inter_test_success_consecutive),
+            ]
+            if args.lan_source_port_range is not None:
+                recovery_cmd.extend([
+                    "--lan-source-port-range",
+                    format_lan_source_port_range(args.lan_source_port_range),
+                ])
+            print("------------------------------------------------------------")
+            print(f"[RECOVERY] {previous_item['name']} -> {item['name']}")
+            print(" ".join(recovery_cmd))
+            print("------------------------------------------------------------")
+            if not args.dry_run:
+                recovery_rc = subprocess.call(recovery_cmd, cwd=str(SCRIPT_DIR))
+                if recovery_rc != 0:
+                    failed.append((
+                        f"inter-test recovery: {previous_item['name']} -> {item['name']}",
+                        f"exit code {recovery_rc}",
+                    ))
+                    print(
+                        f"[WARNING] Inter-test recovery failed with exit code {recovery_rc}; "
+                        f"continuing with {item['name']}.",
+                        flush=True,
+                    )
+
         child_passthrough_args = filter_passthrough_args(script, passthrough_args)
-        if item.get("key") == "astf_nat" and args.soak_duration_sec is not None:
+        if item.get("key") in {"astf_nat", "ipv6_stability"} and args.soak_duration_sec is not None:
             if args.soak_duration_sec <= 0:
                 raise SystemExit("ERROR: --soak-duration-sec must be positive")
             child_passthrough_args.extend(["--soak-duration-sec", str(args.soak_duration_sec)])
-        if item.get("key") == "dns_latency" and (args.run_all or getattr(args, "run_dns_all", False)):
-            if "--dns-run-delayed-table" not in child_passthrough_args:
-                child_passthrough_args.append("--dns-run-delayed-table")
-        if item.get("key") == "dns_latency" and (args.run_all or getattr(args, "run_dns_load", False)):
-            if "--dns-run-nocache-load" not in child_passthrough_args:
-                child_passthrough_args.append("--dns-run-nocache-load")
-        if item.get("key") == "dns_latency" and getattr(args, "run_dns_load", False):
-            for forced_arg in ("--dns-skip-cache", "--dns-skip-table"):
-                if forced_arg not in child_passthrough_args:
-                    child_passthrough_args.append(forced_arg)
-
         cmd = [
             sys.executable,
             str(script),
@@ -570,6 +605,16 @@ def main():
             "--out-dir", str(child_out_dir),
             "--test-start-delay-sec", str(args.test_start_delay_sec),
         ]
+        if "--repeat" in child_long_options(script):
+            cmd.extend(["--repeat", str(args.repeat)])
+        if (
+            args.lan_source_port_range is not None
+            and "--lan-source-port-range" in child_long_options(script)
+        ):
+            cmd.extend([
+                "--lan-source-port-range",
+                format_lan_source_port_range(args.lan_source_port_range),
+            ])
         cmd.extend(child_passthrough_args)
 
         print("------------------------------------------------------------")
@@ -578,19 +623,27 @@ def main():
         print("------------------------------------------------------------")
 
         if args.dry_run:
+            previous_item = item
             continue
 
         rc = subprocess.call(cmd, cwd=str(SCRIPT_DIR))
         if rc != 0:
             failed.append((name, f"exit code {rc}"))
-            break
+            print(
+                f"[WARNING] {name} failed with exit code {rc}; "
+                "continuing with the remaining selected tests.",
+                flush=True,
+            )
+        previous_item = item
 
     print("============================================================")
     if failed:
-        print("FAILED")
+        print("DONE WITH FAILURES")
         for name, reason in failed:
             print(f"- {name}: {reason}")
+        print("All selected tests were attempted.")
         print(f"Parent out dir: {parent_out_dir}")
+        print("============================================================")
         raise SystemExit(1)
 
     print("DONE")

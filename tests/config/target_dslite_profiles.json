@@ -1,0 +1,49 @@
+{
+  "i226_1g_dslite": {
+    "description": "Intel I226-V, 1GbE DS-Lite router benchmark",
+    "benchmark_mode": "dslite",
+    "line_rate_gbps": 1.0,
+    "interfaces": ["07:00.0", "08:00.0"],
+    "kernel_drivers": ["igc", "igc"],
+    "dpdk_drivers": ["auto", "auto"],
+    "lan_iface": "enp7s0",
+    "wan_iface": "enp8s0",
+    "lan_port": 0,
+    "wan_port": 1,
+    "lan_ip": "192.168.0.2",
+    "lan_prefix_len": 24,
+    "lan_gw": "192.168.0.1",
+    "wan_link_ip": "198.51.100.254",
+    "wan_prefix_len": 24,
+    "wan_gateway_ip": "198.51.100.1",
+    "wan_arp_target": "198.51.100.1",
+    "server_ip": "198.51.100.254",
+    "nat_external_ip_mode": "discover",
+    "nat_pool_cidr": "192.0.2.0/24",
+    "nat_external_port_mode": "discover",
+    "inner_ipv4_mtu": 1460,
+    "tcp_mss": 1420,
+    "tunnel_overhead_bytes": 40,
+    "b4_session_limit": 1000,
+    "supports_high_cps_test": true,
+    "supports_max_sessions_test": true,
+    "supported_tests": ["dslite_stl_throughput", "dslite_tcp_scratch_max_sessions", "dslite_astf_sessions_cps", "dslite_astf_nat_stability", "dslite_l4_latency", "dslite_tcp_source_port_scan"],
+    "trex_cores": 1
+  },
+  "i226_2p5g_dslite": {
+    "extends": "i226_1g_dslite",
+    "description": "Intel I226-V, 2.5GbE DS-Lite router benchmark",
+    "line_rate_gbps": 2.5
+  },
+  "x540_10g_dslite": {
+    "extends": "i226_1g_dslite",
+    "description": "Intel X540, 10GbE DS-Lite router benchmark",
+    "line_rate_gbps": 10.0,
+    "interfaces": ["01:00.0", "01:00.1"],
+    "kernel_drivers": ["ixgbe", "ixgbe"],
+    "lan_iface": "enp1s0f0",
+    "wan_iface": "enp1s0f1",
+    "trex_cores": 2,
+    "astf_cores": 1
+  }
+}

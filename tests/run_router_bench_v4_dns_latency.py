@@ -9,10 +9,15 @@ Topology:
   - The DUT/router must be configured to use the WAN-side test-host IP as its DNS server.
 
 Measurements (execution order):
-  1. cache_table_reuse_size/cache_table_size: preload N unique names at 100 QPS, then
-     re-query the same N names and detect cache overflow from benchmark-name WAN re-queries.
-  2. nocache_rate: unique A queries at E6 QPS steps from 10 to 10000.
-  3. cache_rate: preload 100 names, then round-robin those 100 names at E6 QPS steps.
+Performance mode:
+  1. cache_table_reuse_size: preload N unique names at 100 QPS, then re-query
+     the same N names and detect cache overflow from benchmark-name WAN re-queries.
+  2. cache_rate: preload 100 names, then round-robin those 100 names at E6 QPS steps.
+  3. nocache_rate: unique A queries at E6 QPS steps.
+
+Stability mode is selected by run_router_bench_v4_dns_stability.py:
+  1. cache_table_size: wait for the configured interval, repeat the table-size check.
+  2. nocache_load: hold the manually configured QPS for the configured duration.
 """
 
 import argparse
@@ -40,30 +45,51 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
-DEFAULT_RESULT_ROOT = Path(os.environ.get("TREX_RESULT_ROOT", "/var/trex"))
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    from tests.target_profiles import TARGETS  # type: ignore
+    from tests.lib.config import TARGETS  # type: ignore
 except Exception:
-    from target_profiles import TARGETS  # type: ignore
+    from lib.config import TARGETS  # type: ignore
 
 try:
-    from tests.routerbench_test_start_delay import (  # type: ignore
+    from tests.lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 except Exception:
-    from routerbench_test_start_delay import (  # type: ignore
+    from lib.timing import (  # type: ignore
         DEFAULT_TEST_START_DELAY_SEC,
         wait_before_test_start,
     )
 
 try:
-    from tests.run_router_bench_v4_iperf3_latency import (  # type: ignore
+    from tests.lib.common import (  # type: ignore
+        DEFAULT_RESULT_ROOT,
+        parse_non_negative_float,
+        parse_positive_float,
+        parse_positive_int,
+        ts_compact,
+        ts_iso,
+    )
+    from tests.lib.config import load_defaults as _load_defaults  # type: ignore
+    from tests.lib.output import prepare_details_dir  # type: ignore
+    from tests.lib.preflight import (  # type: ignore
+        ConsecutivePreflightTimeoutError,
+        add_consecutive_preflight_arguments,
+        run_consecutive_preflight,
+        validate_consecutive_preflight_arguments,
+    )
+    from tests.lib.repeat import (
+        DEFAULT_REPEAT,
+        argparse_repeat,
+        run_repeated_subprocesses,
+    )  # type: ignore
+    from tests.lib.source_ports import add_lan_source_port_range_argument  # type: ignore
+    from tests.lib.network import (  # type: ignore
         DEFAULT_INTERFACE_READY_TIMEOUT_SEC,
         DEFAULT_LAN_NS,
         DEFAULT_LAN_PREFIX,
@@ -72,11 +98,9 @@ try:
         DEFAULT_WAN_PREFIX,
         cleanup_namespaces,
         delete_existing_namespaces,
+        make_namespace_arp_refresher,
         merge_target_with_overrides,
         ns_cmd,
-        parse_non_negative_float,
-        parse_positive_float,
-        parse_positive_int,
         prepare_kernel_interfaces_from_profile,
         prepare_trex_interfaces_from_profile,
         require_command,
@@ -84,35 +108,88 @@ try:
         require_root,
         resolve_profile_interfaces,
         setup_namespaces,
-        ts_iso,
+        verify_namespaces,
         wait_test_interfaces_ready,
-        make_namespace_arp_refresher,
     )
 except Exception as exc:  # pragma: no cover
-    raise SystemExit(f"ERROR: failed to import shared namespace helpers from L4 latency script: {exc}")
+    try:
+        from lib.common import (  # type: ignore
+            DEFAULT_RESULT_ROOT,
+            parse_non_negative_float,
+            parse_positive_float,
+            parse_positive_int,
+            ts_compact,
+            ts_iso,
+        )
+        from lib.config import load_defaults as _load_defaults  # type: ignore
+        from lib.output import prepare_details_dir  # type: ignore
+        from lib.preflight import (  # type: ignore
+            ConsecutivePreflightTimeoutError,
+            add_consecutive_preflight_arguments,
+            run_consecutive_preflight,
+            validate_consecutive_preflight_arguments,
+        )
+        from lib.repeat import (
+            DEFAULT_REPEAT,
+            argparse_repeat,
+            run_repeated_subprocesses,
+        )  # type: ignore
+        from lib.source_ports import add_lan_source_port_range_argument  # type: ignore
+        from lib.network import (  # type: ignore
+            DEFAULT_INTERFACE_READY_TIMEOUT_SEC,
+            DEFAULT_LAN_NS,
+            DEFAULT_LAN_PREFIX,
+            DEFAULT_POST_NAMESPACE_SETTLE_SEC,
+            DEFAULT_WAN_NS,
+            DEFAULT_WAN_PREFIX,
+            cleanup_namespaces,
+            delete_existing_namespaces,
+            make_namespace_arp_refresher,
+            merge_target_with_overrides,
+            ns_cmd,
+            prepare_kernel_interfaces_from_profile,
+            prepare_trex_interfaces_from_profile,
+            require_command,
+            require_profile_interfaces,
+            require_root,
+            resolve_profile_interfaces,
+            setup_namespaces,
+            verify_namespaces,
+            wait_test_interfaces_ready,
+        )
+    except Exception:
+        raise SystemExit(f"ERROR: failed to import shared namespace helpers: {exc}")
 
-DEFAULT_DNS_PORT = 53
-DEFAULT_DNS_DURATION_SEC = 10.0
-DEFAULT_DNS_TIMEOUT_SEC = 1.0
-DEFAULT_DNS_TTL_SEC = 300
-DEFAULT_DNS_SERVER_START_DELAY_SEC = 1.0
-DEFAULT_DOMAIN_SUFFIX = "routerbench.example.net"
-DEFAULT_E6_STEPS = [10, 15, 22, 33, 47, 68, 100, 150, 220, 330, 470, 680, 1000, 1500, 2200, 3300, 4700, 6800, 10000]
-DEFAULT_CACHE_E6_STEPS = [10, 15, 22, 33, 47, 68, 100, 150, 220, 330, 470, 680, 1000, 1500, 2200, 3300, 4700, 6800, 10000, 15000, 22000, 33000, 48000]
-DEFAULT_CACHE_PRELOAD_COUNT = 100
-DEFAULT_TABLE_QPS = 100
-DEFAULT_STOP_FAILURE_RATE_PCT = 50.0
-DEFAULT_STOP_RESPONSE_MS = 1000.0
-DEFAULT_TABLE_REUSE_INTERVAL_SEC = 600.0
-DEFAULT_TABLE_OVERFLOW_RATE_PCT = 50.0
-DEFAULT_DNS_SERVER_LOG_BATCH_SIZE = 100000  # retained for CLI compatibility
-DEFAULT_DNS_SERVER_LOG_FLUSH_SEC = 1.0      # stats sidecar update interval
-DEFAULT_DNS_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
-DEFAULT_DNS_SAMPLE_LIMIT = -1
-DEFAULT_DNS_SERVER_QUERY_LOG_LIMIT = 1000   # maximum server-side failure rows; successful queries are never logged
-DEFAULT_NOCACHE_LOAD_DURATION_SEC = 3600.0
-DEFAULT_DNS_LOAD_PROGRESS_INTERVAL_SEC = 10.0
-DEFAULT_DNS_LOAD_RTT_SAMPLE_LIMIT = 100000
+_DNS_DEFAULTS = _load_defaults("dns")
+_NETWORK_DEFAULTS = _load_defaults("network")
+DEFAULT_DNS_PORT = int(_DNS_DEFAULTS["port"])
+DEFAULT_DNS_DURATION_SEC = float(_DNS_DEFAULTS["duration_sec"])
+DEFAULT_DNS_TIMEOUT_SEC = float(_DNS_DEFAULTS["timeout_sec"])
+DEFAULT_DNS_TTL_SEC = int(_DNS_DEFAULTS["ttl_sec"])
+DEFAULT_DNS_SERVER_START_DELAY_SEC = float(_DNS_DEFAULTS["server_start_delay_sec"])
+DEFAULT_DOMAIN_SUFFIX = _DNS_DEFAULTS["domain_suffix"]
+DEFAULT_E6_STEPS = list(_DNS_DEFAULTS["e6_steps"])
+DEFAULT_CACHE_E6_STEPS = list(_DNS_DEFAULTS["cache_e6_steps"])
+DEFAULT_CACHE_PRELOAD_COUNT = int(_DNS_DEFAULTS["cache_preload_count"])
+DEFAULT_TABLE_QPS = int(_DNS_DEFAULTS["table_qps"])
+DEFAULT_STOP_FAILURE_RATE_PCT = float(_DNS_DEFAULTS["stop_failure_rate_pct"])
+DEFAULT_STOP_RESPONSE_MS = float(_DNS_DEFAULTS["stop_response_ms"])
+DEFAULT_TABLE_REUSE_INTERVAL_SEC = float(_DNS_DEFAULTS["table_reuse_interval_sec"])
+DEFAULT_TABLE_OVERFLOW_RATE_PCT = float(_DNS_DEFAULTS["table_overflow_rate_pct"])
+DEFAULT_DNS_SERVER_LOG_BATCH_SIZE = int(_DNS_DEFAULTS["server_log_batch_size"])
+DEFAULT_DNS_SERVER_LOG_FLUSH_SEC = float(_DNS_DEFAULTS["server_log_flush_sec"])
+DEFAULT_DNS_SOCKET_BUFFER_BYTES = int(_DNS_DEFAULTS["socket_buffer_bytes"])
+DEFAULT_DNS_SAMPLE_LIMIT = int(_DNS_DEFAULTS["sample_limit"])
+DEFAULT_DNS_SERVER_QUERY_LOG_LIMIT = int(_DNS_DEFAULTS["server_query_log_limit"])
+DEFAULT_NOCACHE_LOAD_DURATION_SEC = float(_DNS_DEFAULTS["nocache_load_duration_sec"])
+DEFAULT_DNS_LOAD_PROGRESS_INTERVAL_SEC = float(_DNS_DEFAULTS["load_progress_interval_sec"])
+DEFAULT_DNS_LOAD_RTT_SAMPLE_LIMIT = int(_DNS_DEFAULTS["load_rtt_sample_limit"])
+CACHE_TABLE_CONSECUTIVE_NG_LIMIT = 3
+PERFORMANCE_PHASE_ORDER = (
+    "cache_table_reuse_size",
+    "cache_rate",
+    "nocache_rate",
+)
 
 _ARP_REFRESHER = None
 _DNS_SERVER_QUERY_LOG = None
@@ -141,10 +218,6 @@ SUMMARY_FIELDS = [
     "cache_preload_count", "cache_table_size", "cache_overflow_detected",
     "cache_overflow_rate_pct", "stop_reason", "error",
 ]
-
-
-def ts_compact():
-    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def mean(values):
@@ -436,7 +509,7 @@ def run_internal_dns_server(argv):
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--domain-suffix", required=True)
     parser.add_argument("--answer-base-ip", required=True)
-    parser.add_argument("--answer-mode", choices=["random", "fixed"], default="random")
+    parser.add_argument("--answer-mode", choices=["random", "fixed"], default=_DNS_DEFAULTS["answer_mode"])
     parser.add_argument("--answer-random-seed", type=int, default=0)
     parser.add_argument("--max-records", type=int, required=True)
     parser.add_argument("--ttl-sec", type=int, required=True)
@@ -1340,59 +1413,114 @@ def run_client_load_phase(phase, stage, step_value, args, target, out_dir, qname
     preflight_expected_ip = ""
     preflight_wan_qname_seen = 0
     if run_preflight:
-        preflight_qname = make_preflight_qname(args._dns_max_records, args.dns_domain_suffix)
-        preflight_expected_ip = answer_ip_for_qname(
-            preflight_qname, args.dns_domain_suffix, args.dns_answer_base_ip,
-            args._dns_max_records, args.dns_answer_mode, args.dns_answer_random_seed,
-        )
-        before_pf = count_server_queries(_DNS_SERVER_QUERY_LOG) if _DNS_SERVER_QUERY_LOG is not None else 0
-        preflight = run_client_load_phase(
-            "preflight", f"{phase}_{stage}", step_value, args, target, out_dir,
-            [preflight_qname], 3, total_count=3, sample_limit_override=3, run_preflight=False,
-        )
-        if _DNS_SERVER_QUERY_LOG is not None:
-            preflight_wan_qname_seen, after_pf, _stats = wait_for_server_qname(
-                _DNS_SERVER_QUERY_LOG, preflight_qname, before_pf,
-                timeout_sec=max(3.0, float(args.dns_timeout_sec) + 2.0),
+        last_attempt = {}
+
+        def dns_preflight_probe(attempt):
+            nonlocal preflight_wan_queries, last_attempt
+            attempt_qname = make_preflight_qname(
+                args._dns_max_records, args.dns_domain_suffix
             )
-        else:
-            after_pf = before_pf
-        preflight_wan_queries = max(0, int(after_pf) - int(before_pf))
-        preflight_failure_rate = preflight.get("failure_rate_pct")
-        if preflight_failure_rate in (None, ""):
-            preflight_failure_rate = 100.0
-        preflight_wrong = int(preflight.get("wrong_answer_count") or 0)
-        if (
-            int(preflight.get("samples_received") or 0) < 3
-            or float(preflight_failure_rate) > 0.0
-            or preflight_wrong > 0
-        ):
+            attempt_expected_ip = answer_ip_for_qname(
+                attempt_qname,
+                args.dns_domain_suffix,
+                args.dns_answer_base_ip,
+                args._dns_max_records,
+                args.dns_answer_mode,
+                args.dns_answer_random_seed,
+            )
+            before_pf = (
+                count_server_queries(_DNS_SERVER_QUERY_LOG)
+                if _DNS_SERVER_QUERY_LOG is not None
+                else 0
+            )
+            attempt_data = run_client_load_phase(
+                "preflight",
+                f"{phase}_{stage}_attempt{attempt}",
+                step_value,
+                args,
+                target,
+                out_dir,
+                [attempt_qname],
+                3,
+                total_count=3,
+                sample_limit_override=3,
+                run_preflight=False,
+            )
+            if _DNS_SERVER_QUERY_LOG is not None:
+                wan_seen, after_pf, _stats = wait_for_server_qname(
+                    _DNS_SERVER_QUERY_LOG,
+                    attempt_qname,
+                    before_pf,
+                    timeout_sec=max(3.0, float(args.dns_timeout_sec) + 2.0),
+                )
+            else:
+                wan_seen = 0
+                after_pf = before_pf
+            preflight_wan_queries += max(0, int(after_pf) - int(before_pf))
+            last_attempt = {
+                "data": attempt_data,
+                "qname": attempt_qname,
+                "expected_ip": attempt_expected_ip,
+                "wan_seen": int(bool(wan_seen)),
+            }
+            failure_rate = attempt_data.get("failure_rate_pct")
+            if failure_rate in (None, ""):
+                failure_rate = 100.0
+            if (
+                int(attempt_data.get("samples_received") or 0) < 3
+                or float(failure_rate) > 0.0
+                or int(attempt_data.get("wrong_answer_count") or 0) > 0
+            ):
+                raise RuntimeError(
+                    "DNS answer validation failed: "
+                    f"expected_ip={attempt_expected_ip} "
+                    f"observed={attempt_data.get('observed_answer_ips')}"
+                )
+            if not wan_seen:
+                raise RuntimeError(
+                    f"qname={attempt_qname} did not reach the WAN DNS server "
+                    f"at {target['wan_ip']}:{args.dns_port}"
+                )
+            return last_attempt
+
+        try:
+            outcome = run_consecutive_preflight(
+                dns_preflight_probe,
+                phase=f"dns_{phase}_{stage}_{step_value}",
+                csv_path=out_dir / "dns_preflight_recovery.csv",
+                required_successes=args.preflight_success_consecutive,
+                interval_sec=args.preflight_probe_interval_sec,
+                timeout_sec=args.preflight_timeout_sec,
+            )
+        except ConsecutivePreflightTimeoutError as exc:
+            preflight = dict(last_attempt.get("data") or {})
+            preflight_expected_ip = str(last_attempt.get("expected_ip") or "")
+            preflight_wan_qname_seen = int(last_attempt.get("wan_seen") or 0)
             message = (
-                f"DNS answer-validation preflight failed before {phase}/{stage}/{step_value}: "
-                f"expected_ip={preflight_expected_ip} observed={preflight.get('observed_answer_ips')}"
+                f"DNS preflight recovery failed before {phase}/{stage}/{step_value}: {exc}"
             )
             print(f"ERROR: {message}; skipping this DNS item", flush=True)
             return make_phase_error_data(
-                phase, stage, step_value, target_qps, duration_sec, total_count, message,
+                phase,
+                stage,
+                step_value,
+                target_qps,
+                duration_sec,
+                total_count,
+                message,
                 preflight=preflight,
                 preflight_expected_ip=preflight_expected_ip,
                 preflight_wan_qname_seen=preflight_wan_qname_seen,
                 preflight_wan_queries=preflight_wan_queries,
             )
-        if not preflight_wan_qname_seen:
-            message = (
-                f"DNS WAN-path preflight failed before {phase}/{stage}/{step_value}: "
-                f"qname={preflight_qname} did not reach the WAN test DNS server "
-                f"at {target['wan_ip']}:{args.dns_port}"
-            )
-            print(f"ERROR: {message}; skipping this DNS item", flush=True)
-            return make_phase_error_data(
-                phase, stage, step_value, target_qps, duration_sec, total_count, message,
-                preflight=preflight,
-                preflight_expected_ip=preflight_expected_ip,
-                preflight_wan_qname_seen=preflight_wan_qname_seen,
-                preflight_wan_queries=preflight_wan_queries,
-            )
+        preflight_state = dict(outcome.value)
+        preflight = dict(preflight_state["data"])
+        preflight_qname = preflight_state["qname"]
+        preflight_expected_ip = preflight_state["expected_ip"]
+        preflight_wan_qname_seen = preflight_state["wan_seen"]
+        preflight["preflight_attempts"] = outcome.attempts
+        preflight["preflight_consecutive_successes"] = outcome.consecutive_successes
+        preflight["preflight_recovery_elapsed_sec"] = outcome.elapsed_sec
     if _ARP_REFRESHER is not None:
         _ARP_REFRESHER.refresh_now(f"before_{phase}_{stage}_{step_value}", required=True)
     safe_step = str(step_value).replace(".", "_")
@@ -1612,6 +1740,15 @@ def extend_cached_qnames(cache_pool, desired_size, cursor, suffix):
     return new_qnames, cursor
 
 
+def select_cache_rate_qnames(table_cached_qnames, attempted_table_size, limit):
+    count = min(
+        len(table_cached_qnames),
+        int(attempted_table_size),
+        int(limit),
+    )
+    return list(table_cached_qnames[:count])
+
+
 def overflow_rate_pct(wan_delta, table_size):
     try:
         return (float(wan_delta) / max(1.0, float(table_size))) * 100.0
@@ -1628,9 +1765,14 @@ def write_summary_csv(path, rows):
 
 
 def write_metadata(out_dir, args, target, steps, cache_steps, max_records):
+    stability_mode = str(getattr(args, "benchmark_mode", "performance")) == "stability"
     metadata = {
         "created_at": ts_iso(),
-        "mode": "dns_rate_cache_table_benchmark",
+        "mode": (
+            "dns_stability_benchmark"
+            if stability_mode
+            else "dns_forwarder_cache_latency_benchmark"
+        ),
         "target_name": args.target,
         "target": target,
         "args": vars(args),
@@ -1646,12 +1788,14 @@ def write_metadata(out_dir, args, target, steps, cache_steps, max_records):
         "notes": [
             "Configure the DUT/router WAN DNS server to the test host WAN IP before running this benchmark.",
             "The client sends DNS A queries to the DUT LAN IP by default. Override with --dns-client-server-ip when needed.",
+            "Performance mode runs cache_table_reuse_size, cache_rate, then nocache_rate.",
+            "Stability mode runs the delayed cache_table_size pass, then nocache_load at --dns-stability-qps.",
             "nocache_rate uses unique qnames for each request.",
-            "cache_rate preloads 100 qnames, then round-robins those qnames at each target QPS.",
+            "cache_rate takes the first --dns-cache-preload-count qnames from the final attempted table-size step, reloads them, then round-robins them at each target QPS.",
             "cache_rate records WAN re-query count divided by the preload qname count as cache_overflow_rate_pct. It does not stop on WAN re-query rate.",
-            "Table-size tests run before nocache_rate and cache_rate so high-QPS traffic cannot contaminate cache-capacity measurements.",
+            "Table-size tests run before rate tests so high-QPS traffic cannot contaminate cache-capacity measurements.",
             "cache_table_reuse_size grows an independent cumulative qname pool and verifies the whole pool at 100 QPS.",
-            "cache_table_size is the optional delayed table pass using a second independent qname range. It runs only when --dns-run-delayed-table is set, normally injected by launcher --run-all or --run-dns-all.",
+            "cache_table_size is the delayed table pass using a second independent qname range in DNS stability mode.",
             "WAN counters used for cache decisions include only generated benchmark qnames and are stored in dns_server_queries.csv.stats.json. dns_server_queries.csv contains only bounded server-side failure rows.",
             "WAN re-query count divided by verified table size is recorded as cache_overflow_rate_pct. Table-size tests stop when it reaches --dns-table-overflow-rate-pct.",
             "Every LAN response is accepted only when RCODE=NOERROR and the A record exactly matches the deterministic expected IP for that qname.",
@@ -1663,23 +1807,188 @@ def write_metadata(out_dir, args, target, steps, cache_steps, max_records):
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 
-def main():
+def run_cache_rate_benchmark(
+    rows,
+    args,
+    target,
+    out_dir,
+    server_query_log,
+    cache_start,
+    cache_steps,
+    table_cached_qnames=None,
+):
+    if args.dns_skip_cache:
+        return
+
+    print("--- DNS cache_rate start ---", flush=True)
+    cache_qnames = list(table_cached_qnames or [])
+    if cache_qnames:
+        print(
+            f"cache source: reloading the same {len(cache_qnames)} qnames from the "
+            "final attempted cache-table step",
+            flush=True,
+        )
+    else:
+        cache_qnames = make_qnames(
+            cache_start,
+            args.dns_cache_preload_count,
+            args.dns_domain_suffix,
+        )
+
+    cache_qname_count = len(cache_qnames)
+    preload_before = count_server_queries(server_query_log)
+    preload = run_client_load_phase_safe(
+        "cache_rate",
+        "preload",
+        cache_qname_count,
+        args,
+        target,
+        out_dir,
+        cache_qnames,
+        min(1000, max(1, cache_qname_count)),
+        total_count=cache_qname_count,
+    )
+    preload_after = count_server_queries(server_query_log)
+    preload_row = decorate_summary(
+        preload,
+        args,
+        target,
+        "cache_rate",
+        "preload",
+        cache_qname_count,
+        preload_before,
+        preload_after,
+        cache_preload_count=cache_qname_count,
+    )
+    rows.append(preload_row)
+    if phase_has_error(preload):
+        preload_row["stop_reason"] = "step_error"
+        print(
+            f"ERROR: cache_rate preload failed: {preload_row.get('error')}; "
+            "cache_rate QPS steps are skipped",
+            flush=True,
+        )
+        return
+    print(
+        f"cache preload: qnames={cache_qname_count} "
+        f"success={preload_row['success_rate_pct']:.3f}% "
+        f"wan={preload_row['wan_queries_delta']}",
+        flush=True,
+    )
+
+    for qps in cache_steps:
+        before = count_server_queries(server_query_log)
+        data = run_client_load_phase_safe(
+            "cache_rate",
+            "qps",
+            qps,
+            args,
+            target,
+            out_dir,
+            cache_qnames,
+            qps,
+            duration_sec=args.duration,
+        )
+        after = count_server_queries(server_query_log)
+        wan_miss = max(0, after - before)
+        cache_overflow_pct = overflow_rate_pct(wan_miss, cache_qname_count)
+        cache_overflow = (
+            1
+            if float(cache_overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct)
+            else 0
+        )
+        row = decorate_summary(
+            data,
+            args,
+            target,
+            "cache_rate",
+            "qps",
+            qps,
+            before,
+            after,
+            cache_preload_count=cache_qname_count,
+            cache_table_size=cache_qname_count,
+            cache_overflow_detected=cache_overflow,
+            cache_overflow_rate_pct=cache_overflow_pct,
+        )
+        # cache_rate stops only on client-side failure/latency criteria. WAN
+        # re-query rate is recorded, but it does not terminate this phase.
+        stop_reason = (
+            "step_error"
+            if phase_has_error(data)
+            else should_stop(row, args, use_loss=True, use_latency=True)
+        )
+        row["stop_reason"] = stop_reason
+        rows.append(row)
+        if phase_has_error(data):
+            print(
+                f"ERROR: cache_rate failed at qps={qps}: {row.get('error')}; "
+                "moving to completion",
+                flush=True,
+            )
+        else:
+            print(
+                f"cache qps={qps}: success={row['success_rate_pct']:.3f}% "
+                f"failure={row['failure_rate_pct']:.3f}% "
+                f"p95={row['rtt_p95_ms']}ms max={row['rtt_max_ms']}ms "
+                f"wan={row['wan_queries_delta']} "
+                f"wan_rate={row['cache_overflow_rate_pct']:.3f}% "
+                f"overflow={cache_overflow} stop={stop_reason or '-'}",
+                flush=True,
+            )
+        if stop_reason:
+            break
+
+
+def configure_benchmark_mode(args, benchmark_mode):
+    args.benchmark_mode = benchmark_mode
+    if benchmark_mode == "stability":
+        args.dns_skip_cache = True
+        args.dns_skip_nocache = True
+        args.dns_skip_table_reuse = True
+        args.dns_run_delayed_table = not args.dns_skip_table
+        args.dns_run_nocache_load = True
+    else:
+        args.dns_run_delayed_table = False
+        args.dns_run_nocache_load = False
+    return args
+
+
+def main(benchmark_mode="performance"):
     global _ARP_REFRESHER, _DNS_SERVER_QUERY_LOG, _DNS_RUN_LABEL, _DNS_PREFLIGHT_COUNTER
-    parser = argparse.ArgumentParser(description="IPv4 router DNS rate/cache/table benchmark", allow_abbrev=False)
-    parser.add_argument("--target", choices=TARGETS.keys(), default="i226_2p5g")
+    if benchmark_mode not in {"performance", "stability"}:
+        raise ValueError(f"unsupported DNS benchmark mode: {benchmark_mode}")
+    parser = argparse.ArgumentParser(
+        description=(
+            "IPv4 router DNS stability benchmark"
+            if benchmark_mode == "stability"
+            else "IPv4 router DNS cache table/cached/uncached response benchmark"
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("--target", choices=TARGETS.keys(), default=_DNS_DEFAULTS["target"])
     parser.add_argument("--out-dir", default="")
+    if benchmark_mode == "performance":
+        parser.add_argument(
+            "--repeat",
+            type=argparse_repeat,
+            default=DEFAULT_REPEAT,
+            help="Repeat the complete DNS performance benchmark. Default: 1.",
+        )
+    else:
+        parser.set_defaults(repeat=1)
     parser.add_argument("--lan-iface", default="")
     parser.add_argument("--wan-iface", default="")
     parser.add_argument("--lan-ns", default=DEFAULT_LAN_NS)
     parser.add_argument("--wan-ns", default=DEFAULT_WAN_NS)
-    parser.add_argument("--setup-namespaces", dest="setup_namespaces", action="store_true", default=True)
+    parser.add_argument("--setup-namespaces", dest="setup_namespaces", action="store_true", default=_NETWORK_DEFAULTS["setup_namespaces"])
     parser.add_argument("--no-setup-namespaces", dest="setup_namespaces", action="store_false")
-    parser.add_argument("--replace-namespaces", dest="replace_namespaces", action="store_true", default=True)
+    parser.add_argument("--replace-namespaces", dest="replace_namespaces", action="store_true", default=_NETWORK_DEFAULTS["replace_namespaces"])
     parser.add_argument("--no-replace-namespaces", dest="replace_namespaces", action="store_false")
     parser.add_argument("--keep-namespaces", action="store_true")
-    parser.add_argument("--auto-kernel-bind", dest="auto_kernel_bind", action="store_true", default=True)
+    parser.add_argument("--auto-kernel-bind", dest="auto_kernel_bind", action="store_true", default=_NETWORK_DEFAULTS["auto_kernel_bind"])
     parser.add_argument("--no-auto-kernel-bind", dest="auto_kernel_bind", action="store_false")
-    parser.add_argument("--restore-dpdk-after", dest="restore_dpdk_after", action="store_true", default=True)
+    parser.add_argument("--restore-dpdk-after", dest="restore_dpdk_after", action="store_true", default=_NETWORK_DEFAULTS["restore_dpdk_after"])
     parser.add_argument("--no-restore-dpdk-after", dest="restore_dpdk_after", action="store_false")
     parser.add_argument("--dpdk-driver", default="")
     parser.add_argument("--lan-prefix", type=parse_positive_int, default=DEFAULT_LAN_PREFIX)
@@ -1689,9 +1998,10 @@ def main():
     parser.add_argument("--wan-ip", default="")
     parser.add_argument("--wan-gw", default="")
     parser.add_argument("--router-wan-ip", default="")
+    add_lan_source_port_range_argument(parser)
     parser.add_argument("--post-namespace-settle-sec", type=parse_non_negative_float, default=DEFAULT_POST_NAMESPACE_SETTLE_SEC)
     parser.add_argument("--test-start-delay-sec", type=parse_non_negative_float, default=DEFAULT_TEST_START_DELAY_SEC, help="Seconds to wait after namespace interfaces report link-up and before testing. Default: 15.")
-    parser.add_argument("--wait-interfaces-ready", dest="wait_interfaces_ready", action="store_true", default=True)
+    parser.add_argument("--wait-interfaces-ready", dest="wait_interfaces_ready", action="store_true", default=_NETWORK_DEFAULTS["wait_interfaces_ready"])
     parser.add_argument("--no-wait-interfaces-ready", dest="wait_interfaces_ready", action="store_false")
     parser.add_argument("--interface-ready-timeout-sec", type=parse_positive_float, default=DEFAULT_INTERFACE_READY_TIMEOUT_SEC)
 
@@ -1699,9 +2009,9 @@ def main():
     parser.add_argument("--dns-port", type=parse_positive_int, default=DEFAULT_DNS_PORT)
     parser.add_argument("--dns-domain-suffix", default=DEFAULT_DOMAIN_SUFFIX)
     parser.add_argument("--dns-run-label", default="", help="Optional DNS label identifying this run. Default: random unique label.")
-    parser.add_argument("--dns-answer-mode", choices=["random", "fixed"], default="random", help="A-record answer mode. Default: random deterministic public-looking addresses.")
-    parser.add_argument("--dns-answer-base-ip", default="93.184.0.1", help="Base A-record answer address used when --dns-answer-mode fixed is selected.")
-    parser.add_argument("--dns-answer-random-seed", type=int, default=20260621, help="Seed for deterministic random public-looking DNS answer addresses.")
+    parser.add_argument("--dns-answer-mode", choices=["random", "fixed"], default=_DNS_DEFAULTS["answer_mode"], help="A-record answer mode. Default: random deterministic public-looking addresses.")
+    parser.add_argument("--dns-answer-base-ip", default=_DNS_DEFAULTS["answer_base_ip"], help="Base A-record answer address used when --dns-answer-mode fixed is selected.")
+    parser.add_argument("--dns-answer-random-seed", type=int, default=_DNS_DEFAULTS["answer_random_seed"], help="Seed for deterministic random public-looking DNS answer addresses.")
     parser.add_argument("--dns-ttl-sec", type=parse_positive_int, default=DEFAULT_DNS_TTL_SEC)
     parser.add_argument("--dns-timeout-sec", type=parse_positive_float, default=DEFAULT_DNS_TIMEOUT_SEC)
     parser.add_argument("--dns-sample-limit", type=int, default=DEFAULT_DNS_SAMPLE_LIMIT, help="Per-step sample CSV rows. -1 logs all rows after each step, 0 disables per-query sample CSV output, positive values keep first N rows plus important failures.")
@@ -1719,19 +2029,33 @@ def main():
     parser.add_argument("--dns-stop-failure-rate-pct", type=parse_positive_float, default=DEFAULT_STOP_FAILURE_RATE_PCT)
     parser.add_argument("--dns-stop-response-ms", type=parse_positive_float, default=DEFAULT_STOP_RESPONSE_MS)
     parser.add_argument("--dns-table-overflow-rate-pct", type=parse_positive_float, default=DEFAULT_TABLE_OVERFLOW_RATE_PCT, help="Stop DNS table-size tests when WAN re-query count / verified table size reaches this percentage.")
-    parser.add_argument("--dns-table-reuse-interval-sec", type=parse_non_negative_float, default=DEFAULT_TABLE_REUSE_INTERVAL_SEC, help="Wait time before the delayed second/table-size pass. Default: 600 seconds. This pass runs only with --dns-run-delayed-table.")
-    parser.add_argument("--dns-run-delayed-table", action="store_true", help="Run the delayed cache_table_size pass after --dns-table-reuse-interval-sec. The launcher injects this for --run-all and --run-dns-all.")
-    parser.add_argument("--dns-run-nocache-load", action="store_true", help="Run a sustained nocache DNS load after nocache_rate. The load QPS is the step before the failure-rate stop point, or the highest attempted QPS when the failure-rate threshold is not hit.")
-    parser.add_argument("--dns-nocache-load-duration-sec", type=parse_positive_float, default=DEFAULT_NOCACHE_LOAD_DURATION_SEC, help="Sustained nocache DNS load duration in seconds. Default: 3600.")
-    parser.add_argument("--dns-nocache-load-sample-limit", type=int, default=0, help="LAN-side sample CSV row limit for nocache_load. Default: 0 to avoid large files.")
-    parser.add_argument("--dns-load-progress-interval-sec", type=parse_non_negative_float, default=DEFAULT_DNS_LOAD_PROGRESS_INTERVAL_SEC, help="Progress print interval for nocache_load in seconds. Default: 10. Use 0 to disable.")
+    if benchmark_mode == "stability":
+        parser.add_argument("--dns-table-reuse-interval-sec", type=parse_non_negative_float, default=DEFAULT_TABLE_REUSE_INTERVAL_SEC, help="Wait time before the delayed table-size pass. Default: 600 seconds.")
+        parser.add_argument("--dns-stability-qps", type=parse_positive_float, default=float(_DNS_DEFAULTS["stability_qps"]), help="Fixed QPS used by DNS stability mode. Default: 100.")
+        parser.add_argument("--dns-nocache-load-duration-sec", type=parse_positive_float, default=DEFAULT_NOCACHE_LOAD_DURATION_SEC, help="Sustained unique-qname DNS load duration in seconds. Default: 3600.")
+        parser.add_argument("--dns-nocache-load-sample-limit", type=int, default=_DNS_DEFAULTS["nocache_load_sample_limit"], help="LAN-side sample CSV row limit for nocache_load. Default: 0 to avoid large files.")
+        parser.add_argument("--dns-load-progress-interval-sec", type=parse_non_negative_float, default=DEFAULT_DNS_LOAD_PROGRESS_INTERVAL_SEC, help="Progress print interval for nocache_load in seconds. Default: 10. Use 0 to disable.")
+    else:
+        parser.set_defaults(
+            dns_table_reuse_interval_sec=DEFAULT_TABLE_REUSE_INTERVAL_SEC,
+            dns_stability_qps=float(_DNS_DEFAULTS["stability_qps"]),
+            dns_nocache_load_duration_sec=DEFAULT_NOCACHE_LOAD_DURATION_SEC,
+            dns_nocache_load_sample_limit=int(_DNS_DEFAULTS["nocache_load_sample_limit"]),
+            dns_load_progress_interval_sec=DEFAULT_DNS_LOAD_PROGRESS_INTERVAL_SEC,
+        )
     parser.add_argument("--dns-randomize", action="store_true", help="Shuffle generated unique names before each measurement.")
     parser.add_argument("--dns-skip-nocache", action="store_true")
     parser.add_argument("--dns-skip-cache", action="store_true")
     parser.add_argument("--dns-skip-table", action="store_true")
-    parser.add_argument("--dns-skip-table-reuse", action="store_true", help="Skip the cumulative/reuse cache table-size test that runs before the delayed table test.")
+    parser.add_argument("--dns-skip-table-reuse", action="store_true", help=argparse.SUPPRESS)
+    add_consecutive_preflight_arguments(parser)
 
     args, unknown_args = parser.parse_known_args()
+    if benchmark_mode == "stability" and any(
+        argument == "--repeat" or argument.startswith("--repeat=")
+        for argument in unknown_args
+    ):
+        raise SystemExit("ERROR: --repeat is not supported by the DNS stability benchmark")
     if unknown_args:
         print(f"WARNING: ignored unsupported options for DNS latency script: {' '.join(unknown_args)}")
     if args.dns_port > 65535:
@@ -1740,6 +2064,26 @@ def main():
         raise SystemExit("ERROR: --lan-prefix and --wan-prefix must be 1..32")
     if args.dns_record_count < 0:
         raise SystemExit("ERROR: --dns-record-count must be zero or positive")
+    validate_consecutive_preflight_arguments(args)
+    if benchmark_mode == "performance":
+        repeat_out_dir = (
+            Path(args.out_dir)
+            if args.out_dir
+            else DEFAULT_RESULT_ROOT
+            / f"dns_forwarder_cache_latency_{args.target}_{ts_compact()}"
+        )
+        repeated_rc = run_repeated_subprocesses(
+            args.repeat,
+            repeat_out_dir,
+            summary_filenames=("summary_all.csv",),
+            script_path=sys.argv[0],
+            cwd=REPO_DIR,
+        )
+        if repeated_rc is not None:
+            if repeated_rc != 0:
+                raise SystemExit(repeated_rc)
+            return
+    configure_benchmark_mode(args, benchmark_mode)
     args.dns_domain_suffix = str(args.dns_domain_suffix).strip(".").lower()
     run_label = str(args.dns_run_label or f"run{dt.datetime.now().strftime('%Y%m%dt%H%M%S')}-{secrets.token_hex(4)}").strip(".").lower()
     if not run_label or len(run_label) > 63 or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789-" for ch in run_label) or run_label[0] == "-" or run_label[-1] == "-":
@@ -1763,7 +2107,20 @@ def main():
     # already touched by nocache_rate, which could contaminate cache capacity
     # checks.  These offsets keep the phases independent and make the automatic
     # dummy record count deterministic.
-    nocache_record_need = 0 if args.dns_skip_nocache else sum(max(1, int(round(float(qps) * float(args.duration)))) for qps in steps)
+    if benchmark_mode == "stability":
+        nocache_record_need = max(
+            1,
+            int(math.ceil(float(args.dns_stability_qps) * float(args.dns_nocache_load_duration_sec))),
+        )
+    else:
+        nocache_record_need = (
+            0
+            if args.dns_skip_nocache
+            else sum(
+                max(1, int(round(float(qps) * float(args.duration))))
+                for qps in steps
+            )
+        )
     cache_record_need = 0 if args.dns_skip_cache else int(args.dns_cache_preload_count)
     # Table tests run before the rate tests and use independent cumulative qname pools.
     # One max_step-sized range is enough for each pass.  A second disjoint range keeps
@@ -1788,17 +2145,19 @@ def main():
         )
 
     target = merge_target_with_overrides(TARGETS[args.target], args)
-    out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"dns_rate_cache_table_{args.target}_{ts_compact()}"
+    default_dir_prefix = "dns_stability" if benchmark_mode == "stability" else "dns_forwarder_cache_latency"
+    out_dir = Path(args.out_dir) if args.out_dir else DEFAULT_RESULT_ROOT / f"{default_dir_prefix}_{args.target}_{ts_compact()}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    details_dir = prepare_details_dir(out_dir)
 
-    server_query_log = out_dir / "dns_server_queries.csv"
+    server_query_log = details_dir / "dns_server_queries.csv"
     _DNS_SERVER_QUERY_LOG = server_query_log
     args._dns_max_records = max_records
     with open(server_query_log, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(["unix_ts", "qname", "error"])
 
     rows = []
-    ns_log_path = out_dir / "namespace_setup.csv"
+    ns_log_path = details_dir / "namespace_setup.csv"
     with open(ns_log_path, "w", newline="", encoding="utf-8") as ns_log_file:
         ns_log = csv.writer(ns_log_file)
         ns_log.writerow(["ts_local", "action", "detail"])
@@ -1809,10 +2168,14 @@ def main():
         resolve_profile_interfaces(args, target, ns_log)
         if args.setup_namespaces:
             require_profile_interfaces(args, target)
-        write_metadata(out_dir, args, target, steps, cache_steps, max_records)
+        write_metadata(details_dir, args, target, steps, cache_steps, max_records)
 
         print("============================================================")
-        print("IPv4 router DNS rate/cache/table benchmark")
+        print(
+            "IPv4 router DNS stability benchmark"
+            if benchmark_mode == "stability"
+            else "IPv4 router DNS cache table/cached/uncached response benchmark"
+        )
         print("============================================================")
         print(f"Target          : {args.target}")
         print(f"Description     : {target['description']}")
@@ -1853,11 +2216,11 @@ def main():
             if args.post_namespace_settle_sec > 0:
                 time.sleep(args.post_namespace_settle_sec)
             wait_before_test_start(args.test_start_delay_sec, "DNS benchmark")
-            _ARP_REFRESHER = make_namespace_arp_refresher(args, target, out_dir)
+            _ARP_REFRESHER = make_namespace_arp_refresher(args, target, details_dir)
             _ARP_REFRESHER.refresh_now("startup", required=True)
             _ARP_REFRESHER.start()
 
-            server_proc, server_stdout, server_stderr = start_dns_server(args, target, out_dir, server_query_log, max_records)
+            server_proc, server_stdout, server_stderr = start_dns_server(args, target, details_dir, server_query_log, max_records)
             time.sleep(args.dns_server_start_delay_sec)
             if server_proc.poll() is not None:
                 raise RuntimeError(f"DNS server exited before measurement; exit_code={server_proc.returncode}")
@@ -1866,30 +2229,73 @@ def main():
             # High-QPS DNS phases can leave queued upstream traffic in the DUT and
             # can evict or expire entries before the table check begins.
             table_cached_qnames = []
+            cache_rate_qnames = []
             table_cursor = table_start
             delayed_table_cursor = table_delayed_start
 
             if not args.dns_skip_table and not args.dns_skip_table_reuse:
                 print("--- DNS cache_table_reuse_size start ---", flush=True)
+                consecutive_table_ng = 0
+                retry_full_preload = False
                 for table_size in steps:
                     new_qnames, table_cursor = extend_cached_qnames(table_cached_qnames, table_size, table_cursor, args.dns_domain_suffix)
-                    if new_qnames:
+                    cache_rate_qnames = select_cache_rate_qnames(
+                        table_cached_qnames,
+                        table_size,
+                        args.dns_cache_preload_count,
+                    )
+                    full_preload_retry = retry_full_preload
+                    preload_qnames = (
+                        list(table_cached_qnames[:table_size])
+                        if full_preload_retry
+                        else new_qnames
+                    )
+                    retry_full_preload = False
+                    if preload_qnames:
                         preload_before = count_server_queries(server_query_log)
-                        preload = run_client_load_phase_safe("cache_table_reuse_size", "preload_added", table_size, args, target, out_dir, new_qnames, args.dns_table_qps, total_count=len(new_qnames))
+                        preload = run_client_load_phase_safe(
+                            "cache_table_reuse_size",
+                            "preload_full_retry" if full_preload_retry else "preload_added",
+                            table_size,
+                            args,
+                            target,
+                            details_dir,
+                            preload_qnames,
+                            args.dns_table_qps,
+                            total_count=len(preload_qnames),
+                        )
                         preload_after = count_server_queries(server_query_log)
-                        preload_row = decorate_summary(preload, args, target, "cache_table_reuse_size", "preload_added", table_size, preload_before, preload_after, cache_table_size=table_size)
+                        preload_row = decorate_summary(
+                            preload,
+                            args,
+                            target,
+                            "cache_table_reuse_size",
+                            "preload_full_retry" if full_preload_retry else "preload_added",
+                            table_size,
+                            preload_before,
+                            preload_after,
+                            cache_table_size=table_size,
+                        )
                         rows.append(preload_row)
                         if phase_has_error(preload):
-                            preload_row["stop_reason"] = "step_error"
+                            consecutive_table_ng += 1
+                            retry_full_preload = True
+                            stop_reason = "step_error"
+                            if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
+                                stop_reason += ";three_consecutive_ng"
+                            preload_row["stop_reason"] = stop_reason
                             print(
                                 f"ERROR: cache_table_reuse_size preload failed at table={table_size}: "
-                                f"{preload_row.get('error')}; moving to the next DNS item",
+                                f"{preload_row.get('error')}; "
+                                f"consecutive_ng={consecutive_table_ng}/{CACHE_TABLE_CONSECUTIVE_NG_LIMIT}",
                                 flush=True,
                             )
-                            break
+                            if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
+                                break
+                            continue
                     verify_qnames = list(table_cached_qnames[:table_size])
                     before = count_server_queries(server_query_log)
-                    data = run_client_load_phase_safe("cache_table_reuse_size", "verify_reused", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
+                    data = run_client_load_phase_safe("cache_table_reuse_size", "verify_reused", table_size, args, target, details_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
                     time.sleep(0.2)
                     after = count_server_queries(server_query_log)
                     wan_delta = max(0, after - before)
@@ -1897,17 +2303,23 @@ def main():
                     overflow = 1 if float(overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct) else 0
                     row = decorate_summary(data, args, target, "cache_table_reuse_size", "verify_reused", table_size, before, after, cache_table_size=table_size, cache_overflow_detected=overflow, cache_overflow_rate_pct=overflow_pct)
                     stop_reason = "step_error" if phase_has_error(data) else should_stop_table(row, args)
+                    if stop_reason:
+                        consecutive_table_ng += 1
+                        if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
+                            stop_reason += ";three_consecutive_ng"
+                    else:
+                        consecutive_table_ng = 0
                     row["stop_reason"] = stop_reason
                     rows.append(row)
                     if phase_has_error(data):
                         print(
                             f"ERROR: cache_table_reuse_size verify failed at table={table_size}: "
-                            f"{row.get('error')}; moving to the next DNS item",
+                            f"{row.get('error')}; consecutive_ng={consecutive_table_ng}/{CACHE_TABLE_CONSECUTIVE_NG_LIMIT}",
                             flush=True,
                         )
                     else:
-                        print(f"reuse_table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} stop={stop_reason or '-'}", flush=True)
-                    if stop_reason:
+                        print(f"reuse_table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} consecutive_ng={consecutive_table_ng}/{CACHE_TABLE_CONSECUTIVE_NG_LIMIT} stop={stop_reason or '-'}", flush=True)
+                    if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
                         break
 
             if not args.dns_skip_table and args.dns_run_delayed_table:
@@ -1916,6 +2328,7 @@ def main():
                     time.sleep(float(args.dns_table_reuse_interval_sec))
                 print("--- DNS cache_table_size start ---", flush=True)
                 delayed_table_cached_qnames = []
+                consecutive_table_ng = 0
                 for table_size in steps:
                     new_qnames, delayed_table_cursor = extend_cached_qnames(delayed_table_cached_qnames, table_size, delayed_table_cursor, args.dns_domain_suffix)
                     verify_qnames = list(delayed_table_cached_qnames[:table_size])
@@ -1925,20 +2338,27 @@ def main():
                     # the verify stage merely measures expired-cache misses and reports
                     # wan_verify ~= table_size even when the cache table itself is fine.
                     preload_before = count_server_queries(server_query_log)
-                    preload = run_client_load_phase_safe("cache_table_size", "preload_full", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
+                    preload = run_client_load_phase_safe("cache_table_size", "preload_full", table_size, args, target, details_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
                     preload_after = count_server_queries(server_query_log)
                     preload_row = decorate_summary(preload, args, target, "cache_table_size", "preload_full", table_size, preload_before, preload_after, cache_table_size=table_size)
                     rows.append(preload_row)
                     if phase_has_error(preload):
-                        preload_row["stop_reason"] = "step_error"
+                        consecutive_table_ng += 1
+                        stop_reason = "step_error"
+                        if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
+                            stop_reason += ";three_consecutive_ng"
+                        preload_row["stop_reason"] = stop_reason
                         print(
                             f"ERROR: cache_table_size preload failed at table={table_size}: "
-                            f"{preload_row.get('error')}; moving to the next DNS item",
+                            f"{preload_row.get('error')}; "
+                            f"consecutive_ng={consecutive_table_ng}/{CACHE_TABLE_CONSECUTIVE_NG_LIMIT}",
                             flush=True,
                         )
-                        break
+                        if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
+                            break
+                        continue
                     before = count_server_queries(server_query_log)
-                    data = run_client_load_phase_safe("cache_table_size", "verify_reused", table_size, args, target, out_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
+                    data = run_client_load_phase_safe("cache_table_size", "verify_reused", table_size, args, target, details_dir, verify_qnames, args.dns_table_qps, total_count=table_size)
                     time.sleep(0.2)
                     after = count_server_queries(server_query_log)
                     wan_delta = max(0, after - before)
@@ -1946,19 +2366,37 @@ def main():
                     overflow = 1 if float(overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct) else 0
                     row = decorate_summary(data, args, target, "cache_table_size", "verify_reused", table_size, before, after, cache_table_size=table_size, cache_overflow_detected=overflow, cache_overflow_rate_pct=overflow_pct)
                     stop_reason = "step_error" if phase_has_error(data) else should_stop_table(row, args)
+                    if stop_reason:
+                        consecutive_table_ng += 1
+                        if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
+                            stop_reason += ";three_consecutive_ng"
+                    else:
+                        consecutive_table_ng = 0
                     row["stop_reason"] = stop_reason
                     rows.append(row)
                     if phase_has_error(data):
                         print(
                             f"ERROR: cache_table_size verify failed at table={table_size}: "
-                            f"{row.get('error')}; moving to the next DNS item",
+                            f"{row.get('error')}; consecutive_ng={consecutive_table_ng}/{CACHE_TABLE_CONSECUTIVE_NG_LIMIT}",
                             flush=True,
                         )
                     else:
-                        print(f"table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} stop={stop_reason or '-'}", flush=True)
-                    if stop_reason:
+                        print(f"table={table_size}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% wan_verify={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={overflow} consecutive_ng={consecutive_table_ng}/{CACHE_TABLE_CONSECUTIVE_NG_LIMIT} stop={stop_reason or '-'}", flush=True)
+                    if consecutive_table_ng >= CACHE_TABLE_CONSECUTIVE_NG_LIMIT:
                         break
 
+            # Performance mode order:
+            # cache table size -> cached response rate -> uncached response rate.
+            run_cache_rate_benchmark(
+                rows,
+                args,
+                target,
+                details_dir,
+                server_query_log,
+                cache_start,
+                cache_steps,
+                table_cached_qnames=cache_rate_qnames,
+            )
 
             cursor = nocache_start
             nocache_rate_qnames = []
@@ -1966,6 +2404,16 @@ def main():
             nocache_prev_before_failure_qps = None
             nocache_load_qps = None
             nocache_rate_usable = False
+            if benchmark_mode == "stability":
+                nocache_load_qps = float(args.dns_stability_qps)
+                nocache_rate_qnames = make_qnames(
+                    cursor,
+                    nocache_record_need,
+                    args.dns_domain_suffix,
+                )
+                if args.dns_randomize:
+                    random.shuffle(nocache_rate_qnames)
+                nocache_rate_usable = True
             if not args.dns_skip_nocache:
                 print("--- DNS nocache_rate start ---", flush=True)
                 for qps in steps:
@@ -1977,7 +2425,7 @@ def main():
                     nocache_rate_qnames.extend(qnames)
                     nocache_last_attempted_qps = qps
                     before = count_server_queries(server_query_log)
-                    data = run_client_load_phase_safe("nocache_rate", "qps", qps, args, target, out_dir, qnames, qps, duration_sec=args.duration)
+                    data = run_client_load_phase_safe("nocache_rate", "qps", qps, args, target, details_dir, qnames, qps, duration_sec=args.duration)
                     after = count_server_queries(server_query_log)
                     row = decorate_summary(data, args, target, "nocache_rate", "qps", qps, before, after)
                     stop_reason = "step_error" if phase_has_error(data) else should_stop(row, args, use_loss=True, use_latency=True)
@@ -2021,7 +2469,7 @@ def main():
                         nocache_load_qps,
                         args,
                         target,
-                        out_dir,
+                        details_dir,
                         nocache_rate_qnames,
                         nocache_load_qps,
                         duration_sec=args.dns_nocache_load_duration_sec,
@@ -2035,57 +2483,6 @@ def main():
                         print(f"ERROR: nocache_load failed: {row.get('error')}; moving to the next DNS item", flush=True)
                     else:
                         print(f"nocache_load qps={nocache_load_qps}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% actual_qps={row['actual_qps']:.3f} sent={row['samples_sent']} received={row['samples_received']} timeout={row['timeout_count']} error={row['error_count']} wan={row['wan_queries_delta']}", flush=True)
-
-            if not args.dns_skip_cache:
-                print("--- DNS cache_rate start ---", flush=True)
-                cache_qnames = make_qnames(cache_start, args.dns_cache_preload_count, args.dns_domain_suffix)
-                preload_before = count_server_queries(server_query_log)
-                preload = run_client_load_phase_safe("cache_rate", "preload", args.dns_cache_preload_count, args, target, out_dir, cache_qnames, min(1000, max(1, args.dns_cache_preload_count)), total_count=args.dns_cache_preload_count)
-                preload_after = count_server_queries(server_query_log)
-                preload_row = decorate_summary(preload, args, target, "cache_rate", "preload", args.dns_cache_preload_count, preload_before, preload_after, cache_preload_count=args.dns_cache_preload_count)
-                rows.append(preload_row)
-                if phase_has_error(preload):
-                    preload_row["stop_reason"] = "step_error"
-                    print(
-                        f"ERROR: cache_rate preload failed: {preload_row.get('error')}; "
-                        "cache_rate QPS steps are skipped",
-                        flush=True,
-                    )
-                else:
-                    print(f"cache preload: success={preload_row['success_rate_pct']:.3f}% wan={preload_row['wan_queries_delta']}", flush=True)
-                    for qps in cache_steps:
-                        before = count_server_queries(server_query_log)
-                        data = run_client_load_phase_safe("cache_rate", "qps", qps, args, target, out_dir, cache_qnames, qps, duration_sec=args.duration)
-                        after = count_server_queries(server_query_log)
-                        wan_miss = max(0, after - before)
-                        cache_overflow_pct = overflow_rate_pct(wan_miss, args.dns_cache_preload_count)
-                        cache_overflow = 1 if float(cache_overflow_pct or 0.0) >= float(args.dns_table_overflow_rate_pct) else 0
-                        row = decorate_summary(
-                            data,
-                            args,
-                            target,
-                            "cache_rate",
-                            "qps",
-                            qps,
-                            before,
-                            after,
-                            cache_preload_count=args.dns_cache_preload_count,
-                            cache_table_size=args.dns_cache_preload_count,
-                            cache_overflow_detected=cache_overflow,
-                            cache_overflow_rate_pct=cache_overflow_pct,
-                        )
-                        # cache_rate should stop only on client-side failure/latency criteria.
-                        # WAN re-query rate is still recorded as cache_overflow_rate_pct,
-                        # but it must not terminate cache_rate.
-                        stop_reason = "step_error" if phase_has_error(data) else should_stop(row, args, use_loss=True, use_latency=True)
-                        row["stop_reason"] = stop_reason
-                        rows.append(row)
-                        if phase_has_error(data):
-                            print(f"ERROR: cache_rate failed at qps={qps}: {row.get('error')}; moving to completion", flush=True)
-                        else:
-                            print(f"cache qps={qps}: success={row['success_rate_pct']:.3f}% failure={row['failure_rate_pct']:.3f}% p95={row['rtt_p95_ms']}ms max={row['rtt_max_ms']}ms wan={row['wan_queries_delta']} wan_rate={row['cache_overflow_rate_pct']:.3f}% overflow={cache_overflow} stop={stop_reason or '-'}", flush=True)
-                        if stop_reason:
-                            break
 
         finally:
             if _ARP_REFRESHER is not None:
@@ -2103,7 +2500,7 @@ def main():
             cleanup_namespaces(args, ns_log)
             if getattr(args, "restore_dpdk_after", True):
                 try:
-                    prep_log = prepare_trex_interfaces_from_profile(target, out_dir, auto_dpdk_bind=True, dpdk_driver_override=getattr(args, "dpdk_driver", ""))
+                    prep_log = prepare_trex_interfaces_from_profile(target, details_dir, auto_dpdk_bind=True, dpdk_driver_override=getattr(args, "dpdk_driver", ""))
                     ns_log.writerow([ts_iso(), "restore_dpdk_after_done", str(prep_log)])
                 except Exception as exc:
                     ns_log.writerow([ts_iso(), "restore_dpdk_after_warning", str(exc)])
@@ -2119,8 +2516,9 @@ def main():
         print(f"Recorded errors    : {len(error_rows)} (see summary_all.csv result/error columns)")
     print(f"Result directory  : {out_dir}")
     print(f"Summary CSV       : {summary_csv}")
+    print(f"Details           : {details_dir}")
     print(f"WAN DNS query log : {server_query_log}")
-    print(f"Metadata          : {out_dir / 'metadata.json'}")
+    print(f"Metadata          : {details_dir / 'metadata.json'}")
 
 
 if __name__ == "__main__":
