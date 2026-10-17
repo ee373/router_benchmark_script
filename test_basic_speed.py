@@ -114,7 +114,7 @@ def ensure_dir(path):
         ) from exc
 
 
-def write_launcher_metadata(parent_out_dir, target, ip_version, enabled_tests, passthrough_args, dry_run, selection_mode, test_start_delay_sec, repeat, inter_test_probe_interval_sec, inter_test_success_consecutive, lan_source_port_range):
+def write_launcher_metadata(parent_out_dir, target, ip_version, enabled_tests, passthrough_args, dry_run, selection_mode, test_start_delay_sec, repeat, inter_test_probe_interval_sec, inter_test_success_consecutive, lan_source_port_range, stl_recovery_probe):
     metadata = {
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
         "target": target,
@@ -133,6 +133,7 @@ def write_launcher_metadata(parent_out_dir, target, ip_version, enabled_tests, p
             "required_consecutive_successes": int(inter_test_success_consecutive),
             "output": "details/inter_test_recovery.csv",
         },
+        "stl_recovery_probe": bool(stl_recovery_probe),
         "lan_source_port_range": format_lan_source_port_range(lan_source_port_range),
         "passthrough_args": list(passthrough_args),
         "tests": [
@@ -445,6 +446,11 @@ def main():
                         help="Seconds between TCP recovery probes before the next selected test. Default: 2.")
     parser.add_argument("--inter-test-success-consecutive", type=int, default=_RECOVERY_DEFAULTS["success_consecutive"],
                         help="Required consecutive successful TCP probes before the next selected test. Default: 3.")
+    parser.add_argument(
+        "--stl-recovery-probe",
+        action="store_true",
+        help="Enable consecutive recovery probes before each STL measurement. Disabled by default; one preflight still runs.",
+    )
     add_lan_source_port_range_argument(parser)
 
     selection = parser.add_argument_group("test selection")
@@ -529,6 +535,7 @@ def main():
             inter_test_probe_interval_sec=args.inter_test_probe_interval_sec,
             inter_test_success_consecutive=args.inter_test_success_consecutive,
             lan_source_port_range=args.lan_source_port_range,
+            stl_recovery_probe=args.stl_recovery_probe,
         )
 
     if enabled_tests:
@@ -615,6 +622,11 @@ def main():
                 "--lan-source-port-range",
                 format_lan_source_port_range(args.lan_source_port_range),
             ])
+        if (
+            args.stl_recovery_probe
+            and "--stl-recovery-probe" in child_long_options(script)
+        ):
+            cmd.append("--stl-recovery-probe")
         cmd.extend(child_passthrough_args)
 
         print("------------------------------------------------------------")

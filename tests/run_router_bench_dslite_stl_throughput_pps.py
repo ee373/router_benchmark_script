@@ -80,6 +80,11 @@ except Exception:
     )
 
 try:
+    from tests.lib.preflight import run_preflight_with_optional_recovery_probe  # type: ignore
+except Exception:
+    from lib.preflight import run_preflight_with_optional_recovery_probe  # type: ignore
+
+try:
     from tests.lib.common import (  # type: ignore
         DEFAULT_RESULT_ROOT,
         flatten,
@@ -616,7 +621,8 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
                   high_loss_threshold, high_loss_consecutive, recovery_probe_interval_sec,
                   recovery_success_consecutive, recovery_timeout_sec,
                   lan_source_port_range, single_load_percent,
-                  test_start_delay_sec=DEFAULT_TEST_START_DELAY_SEC):
+                  test_start_delay_sec=DEFAULT_TEST_START_DELAY_SEC,
+                  recovery_probe_enabled=False):
     add_trex_api_path()
     from trex.stl.api import (
         STLClient,
@@ -1397,7 +1403,13 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             f"--- Preflight {name}: ARP, explicit MAC, warm NAT, "
             "NAT IPv4/port discovery, up/down probe ---"
         )
-        preflight = wait_for_recovery(client, name, preflight_writer, recovery_writer)
+        preflight = run_preflight_with_optional_recovery_probe(
+            lambda: run_preflight(client, name, preflight_writer),
+            lambda: wait_for_recovery(
+                client, name, preflight_writer, recovery_writer
+            ),
+            recovery_probe_enabled,
+        )
         nat_external_ipv4 = preflight["nat_external_ipv4"]
         nat_external_port = preflight["nat_external_udp_port"]
         rate_kwargs = {"pps": rate_pps} if rate_pps is not None else {"bps_l1": bps_l1}
@@ -1677,6 +1689,7 @@ def write_metadata(out_dir, target_name, target, args):
             "output": "stl_preflight.csv",
         },
         "per_step_recovery": {
+            "enabled": args.stl_recovery_probe,
             "probe_interval_sec": args.recovery_probe_interval_sec,
             "required_consecutive_successes": args.recovery_success_consecutive,
             "timeout_sec": args.recovery_timeout_sec,
@@ -1763,6 +1776,11 @@ def main():
                         help="Required consecutive successful connectivity probes before measurement. Default: 3.")
     parser.add_argument("--recovery-timeout-sec", type=float, default=DEFAULT_RECOVERY_TIMEOUT_SEC,
                         help="Maximum preflight recovery wait. Zero disables the timeout. Default: 300.")
+    parser.add_argument(
+        "--stl-recovery-probe",
+        action="store_true",
+        help="Require consecutive recovery probes before each STL measurement. Disabled by default; one preflight still runs.",
+    )
     parser.add_argument("--no-install-cfg", action="store_true")
     parser.add_argument("--auto-dpdk-bind", dest="auto_dpdk_bind", action="store_true", default=_STL_DEFAULTS["auto_dpdk_bind"], help="Before starting TRex, delete stale benchmark namespaces and bind profile PCI devices to their DPDK driver. Enabled by default.")
     parser.add_argument("--no-auto-dpdk-bind", dest="auto_dpdk_bind", action="store_false", help="Do not attempt DPDK driver binding before starting TRex. Stale benchmark namespaces are still removed.")
@@ -1860,7 +1878,10 @@ def main():
         print(f"Rate steps          : {[args.single_load_percent]} %")
     print(f"Refine step         : {args.refine_step}")
     print(f"High-loss stop      : >= {args.high_loss_threshold:.1%} x {args.high_loss_consecutive}")
-    print(f"Recovery probes     : every {args.recovery_probe_interval_sec:g}s, {args.recovery_success_consecutive} consecutive successes, timeout={args.recovery_timeout_sec:g}s")
+    if args.stl_recovery_probe:
+        print(f"Recovery probes     : every {args.recovery_probe_interval_sec:g}s, {args.recovery_success_consecutive} consecutive successes, timeout={args.recovery_timeout_sec:g}s")
+    else:
+        print("Recovery probes     : disabled (one preflight per measurement)")
     print(f"LAN source port     : {first_lan_source_port(args.lan_source_port_range, UDP_PORT)}"
           f" (range {format_lan_source_port_range(args.lan_source_port_range) or 'test default'})")
     print(f"Duration/test       : {args.duration}s")
@@ -1904,6 +1925,7 @@ def main():
                 lan_source_port_range=args.lan_source_port_range,
                 single_load_percent=args.single_load_percent,
                 test_start_delay_sec=args.test_start_delay_sec,
+                recovery_probe_enabled=args.stl_recovery_probe,
             )
         )
     finally:

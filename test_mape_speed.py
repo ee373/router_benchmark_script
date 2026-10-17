@@ -132,6 +132,7 @@ def write_launcher_metadata(out_dir, args, enabled_tests, passthrough_args, sele
             "required_consecutive_successes": int(args.inter_test_success_consecutive),
             "output": "details/inter_test_recovery.csv",
         },
+        "stl_recovery_probe": bool(args.stl_recovery_probe),
         "lan_source_port_range": format_lan_source_port_range(args.lan_source_port_range),
         "passthrough_args": list(passthrough_args),
         "tests": [
@@ -191,6 +192,11 @@ def main():
         type=int,
         default=_RECOVERY_DEFAULTS["success_consecutive"],
         help="Required consecutive successful TCP probes before the next selected test. Default: 3.",
+    )
+    parser.add_argument(
+        "--stl-recovery-probe",
+        action="store_true",
+        help="Enable consecutive recovery probes before each STL measurement. Disabled by default; one preflight still runs.",
     )
     add_lan_source_port_range_argument(parser)
     selection = parser.add_argument_group("test selection")
@@ -315,6 +321,11 @@ def main():
                 "--lan-source-port-range",
                 format_lan_source_port_range(args.lan_source_port_range),
             ])
+        if (
+            args.stl_recovery_probe
+            and "--stl-recovery-probe" in child_long_options(item["script"])
+        ):
+            cmd.append("--stl-recovery-probe")
         cmd.extend(filter_passthrough_args(item["script"], passthrough_args))
         print("------------------------------------------------------------")
         print(f"[RUN] {item['name']}")

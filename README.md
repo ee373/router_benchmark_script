@@ -1,10 +1,12 @@
 ## 通信事前確認の適用範囲
 
-すべての試験は、試験方式に対応した事前確認が3回連続で成功してから
-測定を開始する。失敗時は連続成功数を0へ戻す。標準の試行間隔は2秒、
-復旧待機上限は300秒とし、各試行の結果と復旧所要時間をdetails配下の
-`*_preflight_recovery.csv`へ保存する。STL系は既存の`stl_recovery.csv`、
-DS-Lite source-port scanは専用の事前確認・復旧CSVを使用する。
+STL throughput/PPSは、各測定点で事前確認を1回実行してから測定する。
+`--stl-recovery-probe`を指定すると、従来どおり事前確認が3回連続で成功するまで
+再試行する。その他のテストモードの連続事前確認と、テスト間のRecoveryは
+従来どおり動作する。連続確認では失敗時に成功数を0へ戻し、標準の試行間隔は
+2秒、復旧待機上限は300秒とする。STL系の再試行結果は`stl_recovery.csv`、
+その他のテストモードは各`*_preflight_recovery.csv`、テスト間Recoveryは
+`inter_test_recovery.csv`へ保存する。
 
 | 試験 | 適用する確認 | 適用しない項目と理由 |
 |---|---|---|
@@ -529,4 +531,18 @@ Every benchmark now waits 15 seconds after its test interfaces report link-up an
 
 The basic, DS-Lite, and MAP-E throughput/PPS tests use E12 load steps. Throughput runs from 1 Mbps to the selected profile's maximum speed, and the 64-byte PPS test runs from 1 kpps to the calculated profile maximum. A load series stops after packet loss is at least 50% for three consecutive points.
 
-Before each STL measurement point, connectivity is checked every two seconds and traffic starts after three consecutive successes. Between launcher-managed tests, the same two-second/three-success rule is enforced by `tests/run_router_bench_recovery_check.py`; results are written to `inter_test_recovery.csv`.
+Before each STL measurement point, its connectivity preflight runs once by default.
+Pass `--stl-recovery-probe` to enable the existing recovery loop, which checks
+every two seconds and starts traffic after three consecutive successes. The
+preflight still runs once when the recovery loop is disabled, and a failed
+preflight prevents that measurement point from starting. For example:
+
+```bash
+sudo python3 test_basic_speed.py --target i226_1g --run-stl-throughput --stl-recovery-probe
+sudo python3 test_dslite_speed.py --target i226_1g_dslite --run-stl-throughput --stl-recovery-probe
+sudo python3 test_mape_speed.py --target i226_1g_mape --run-stl-throughput --stl-recovery-probe
+```
+
+Between launcher-managed tests, the existing two-second/three-success rule
+remains enabled and is enforced by `tests/run_router_bench_recovery_check.py`;
+results are written to `inter_test_recovery.csv`.

@@ -493,7 +493,7 @@ Purpose:
 - Writes NDR/PDR summary rows.
 - Before every rate step, refreshes ARP on both ports and writes explicit source/destination MAC addresses into every generated frame.
 - Before every rate step, sends warm-up NAT traffic, captures the WAN-side translated UDP source port, and uses that port for downlink traffic.
-- Before every rate step, verifies 32 uplink packets and 32 downlink packets every two seconds. Measurement starts only after three consecutive successful checks.
+- Before every rate step, verifies 32 uplink packets and 32 downlink packets. By default, one preflight is run; `--stl-recovery-probe` enables retries every two seconds until three consecutive checks succeed.
 - Bidirectional rows include combined counters and independent `up_*` / `down_*` counters and loss rates.
 
 Main outputs:

@@ -4,12 +4,83 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from tests.lib.preflight import run_consecutive_preflight
+from tests.lib.preflight import (
+    run_consecutive_preflight,
+    run_preflight_with_optional_recovery_probe,
+)
 
 
 class ConsecutivePreflightTests(unittest.TestCase):
+    def test_optional_recovery_probe_defaults_to_single_preflight(self):
+        run_preflight = mock.Mock(return_value="preflight result")
+        wait_for_recovery = mock.Mock(return_value="recovery result")
+
+        result = run_preflight_with_optional_recovery_probe(
+            run_preflight,
+            wait_for_recovery,
+            recovery_probe_enabled=False,
+        )
+
+        self.assertEqual(result, "preflight result")
+        run_preflight.assert_called_once_with()
+        wait_for_recovery.assert_not_called()
+
+    def test_optional_recovery_probe_uses_recovery_loop_when_enabled(self):
+        run_preflight = mock.Mock(return_value="preflight result")
+        wait_for_recovery = mock.Mock(return_value="recovery result")
+
+        result = run_preflight_with_optional_recovery_probe(
+            run_preflight,
+            wait_for_recovery,
+            recovery_probe_enabled=True,
+        )
+
+        self.assertEqual(result, "recovery result")
+        run_preflight.assert_not_called()
+        wait_for_recovery.assert_called_once_with()
+
+    def test_stl_recovery_probe_option_is_forwarded_by_each_launcher(self):
+        repo_dir = Path(__file__).resolve().parents[1]
+        launchers = (
+            ("test_basic_speed.py", "i226_1g", ["--ip-version", "v4"]),
+            ("test_dslite_speed.py", "i226_1g_dslite", []),
+            ("test_mape_speed.py", "i226_1g_mape", []),
+        )
+        for launcher, target, extra_args in launchers:
+            for recovery_enabled in (False, True):
+                with self.subTest(
+                    launcher=launcher,
+                    recovery_enabled=recovery_enabled,
+                ):
+                    command = [
+                        sys.executable,
+                        str(repo_dir / launcher),
+                        "--dry-run",
+                        "--run-stl-throughput",
+                        "--target",
+                        target,
+                        *extra_args,
+                    ]
+                    if recovery_enabled:
+                        command.append("--stl-recovery-probe")
+                    proc = subprocess.run(
+                        command,
+                        cwd=repo_dir,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, msg=proc.stdout)
+                    self.assertEqual(
+                        "--stl-recovery-probe" in proc.stdout,
+                        recovery_enabled,
+                    )
+
     def test_failure_resets_consecutive_successes(self):
         outcomes = iter([True, True, False, True, True, True])
         with tempfile.TemporaryDirectory() as tmp:

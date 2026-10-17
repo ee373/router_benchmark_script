@@ -772,7 +772,7 @@ Notes:
 
 - TRex STL/ASTF waits until every selected port reports link UP before ARP resolution or a measurement step.
 - TRex is started with `--arp-refresh-period 60`, so long-running stateful tests send gratuitous ARP every 60 seconds.
-- STL still performs ARP resolution, explicit MAC selection, NAT warm-up, NAT-port discovery, and bidirectional probes before every rate step.
+- STL still performs ARP resolution, explicit MAC selection, NAT warm-up, NAT-port discovery, and bidirectional preflight probes before every rate step. It runs one preflight by default; `--stl-recovery-probe` enables retries every two seconds until three consecutive checks succeed.
 - Namespace/raw-socket tests send a directed ARP request and a gratuitous ARP request before every phase and every 60 seconds while the test remains active.
 - L4 latency, DNS, and TCP scratch tests write `arp_refresh.csv`.
 - DHCP scratch sends ARP announcements from each leased client immediately after DHCP ACK.
