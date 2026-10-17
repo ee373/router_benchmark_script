@@ -4,8 +4,6 @@
 
 import argparse
 import datetime as dt
-import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +17,14 @@ if str(SCRIPT_DIR) not in sys.path:
 from tests.lib.common import DEFAULT_RESULT_ROOT, ts_compact  # type: ignore
 from tests.lib.config import load_defaults  # type: ignore
 from tests.lib.repeat import DEFAULT_REPEAT, argparse_repeat  # type: ignore
-from tests.lib.output import prepare_details_dir  # type: ignore
+from tests.lib.launcher import (  # type: ignore
+    build_default_output_dir,
+    filter_child_passthrough_args,
+    launcher_test_entries,
+    parse_child_long_options,
+    validate_child_passthrough_args,
+    write_launcher_metadata_file,
+)
 from tests.lib.config import DSLITE_TARGETS  # type: ignore
 from tests.lib.source_ports import (  # type: ignore
     add_lan_source_port_range_argument,
@@ -38,7 +43,12 @@ for configured_test in _LAUNCHER_DEFAULTS["test_plan"]:
 
 
 def build_default_out_dir(target):
-    return DEFAULT_RESULT_ROOT / f"trex_dslite_speed_{target}_{ts_compact()}"
+    return build_default_output_dir(
+        DEFAULT_RESULT_ROOT,
+        "trex_dslite_speed",
+        target,
+        ts_compact(),
+    )
 
 
 def child_long_options(script):
@@ -50,68 +60,19 @@ def child_long_options(script):
         text=True,
         check=False,
     )
-    return set(re.findall(r"(?<![A-Za-z0-9_-])--[A-Za-z0-9][A-Za-z0-9_-]*", proc.stdout or ""))
+    return parse_child_long_options(proc.stdout)
 
 
 def validate_passthrough_args(passthrough_args, enabled_tests):
     accepted = set()
     for item in enabled_tests:
         accepted.update(child_long_options(item["script"]))
-    unknown = []
-    stray = []
-    index = 0
-    while index < len(passthrough_args):
-        arg = passthrough_args[index]
-        if arg.startswith("--"):
-            option = arg.split("=", 1)[0]
-            if option not in accepted:
-                unknown.append(option)
-            if (
-                "=" not in arg
-                and index + 1 < len(passthrough_args)
-                and not passthrough_args[index + 1].startswith("-")
-            ):
-                index += 1
-        elif arg.startswith("-"):
-            unknown.append(arg)
-        else:
-            stray.append(arg)
-        index += 1
-    if not unknown and not stray:
-        return
-    lines = []
-    if unknown:
-        lines.append("ERROR: unknown option(s): " + ", ".join(sorted(set(unknown))))
-    if stray:
-        lines.append("ERROR: stray argument(s): " + ", ".join(stray))
-    lines.append("No benchmark was started.")
-    raise SystemExit("\n".join(lines))
+    validate_child_passthrough_args(passthrough_args, accepted)
 
 
 def filter_passthrough_args(script, passthrough_args):
     accepted = child_long_options(script)
-    filtered = []
-    index = 0
-    while index < len(passthrough_args):
-        arg = passthrough_args[index]
-        if arg.startswith("--"):
-            option = arg.split("=", 1)[0]
-            value = None
-            if (
-                "=" not in arg
-                and index + 1 < len(passthrough_args)
-                and not passthrough_args[index + 1].startswith("-")
-            ):
-                index += 1
-                value = passthrough_args[index]
-            if option in accepted:
-                filtered.append(arg)
-                if value is not None:
-                    filtered.append(value)
-        else:
-            filtered.append(arg)
-        index += 1
-    return filtered
+    return filter_child_passthrough_args(passthrough_args, accepted)
 
 
 def write_launcher_metadata(out_dir, args, enabled_tests, passthrough_args, selection_mode):
@@ -135,21 +96,9 @@ def write_launcher_metadata(out_dir, args, enabled_tests, passthrough_args, sele
         "stl_recovery_probe": bool(args.stl_recovery_probe),
         "lan_source_port_range": format_lan_source_port_range(args.lan_source_port_range),
         "passthrough_args": list(passthrough_args),
-        "tests": [
-            {
-                "key": item["key"],
-                "name": item["name"],
-                "script": str(item["script"].relative_to(SCRIPT_DIR)),
-                "out_dir": str((out_dir / item["out_dir_name"]).resolve()),
-            }
-            for item in enabled_tests
-        ],
+        "tests": launcher_test_entries(out_dir, enabled_tests, SCRIPT_DIR),
     }
-    details_dir = prepare_details_dir(out_dir)
-    (details_dir / "launcher_metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    write_launcher_metadata_file(out_dir, metadata)
 
 
 def main():

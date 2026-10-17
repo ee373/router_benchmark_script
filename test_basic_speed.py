@@ -22,9 +22,7 @@
 import argparse
 import datetime as dt
 import difflib
-import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,7 +37,12 @@ from tests.lib.config import TARGETS  # type: ignore
 from tests.lib.common import DEFAULT_RESULT_ROOT, ts_compact  # type: ignore
 from tests.lib.config import load_defaults as _load_defaults  # type: ignore
 from tests.lib.repeat import DEFAULT_REPEAT, argparse_repeat  # type: ignore
-from tests.lib.output import prepare_details_dir  # type: ignore
+from tests.lib.launcher import (  # type: ignore
+    build_default_output_dir,
+    launcher_test_entries,
+    parse_child_long_options,
+    write_launcher_metadata_file,
+)
 from tests.lib.source_ports import (  # type: ignore
     add_lan_source_port_range_argument,
     format_lan_source_port_range,
@@ -100,7 +103,12 @@ DEPRECATED_LAUNCHER_OPTIONS = {
 
 
 def build_default_out_dir(target):
-    return DEFAULT_RESULT_ROOT / f"trex_basic_speed_{target}_{ts_compact()}"
+    return build_default_output_dir(
+        DEFAULT_RESULT_ROOT,
+        "trex_basic_speed",
+        target,
+        ts_compact(),
+    )
 
 
 def ensure_dir(path):
@@ -136,21 +144,9 @@ def write_launcher_metadata(parent_out_dir, target, ip_version, enabled_tests, p
         "stl_recovery_probe": bool(stl_recovery_probe),
         "lan_source_port_range": format_lan_source_port_range(lan_source_port_range),
         "passthrough_args": list(passthrough_args),
-        "tests": [
-            {
-                "key": item["key"],
-                "name": item["name"],
-                "script": str(item["script"].relative_to(SCRIPT_DIR)),
-                "out_dir": str((parent_out_dir / item["out_dir_name"]).resolve()),
-            }
-            for item in enabled_tests
-        ],
+        "tests": launcher_test_entries(parent_out_dir, enabled_tests, SCRIPT_DIR),
     }
-    details_dir = prepare_details_dir(parent_out_dir)
-    (details_dir / "launcher_metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
+    write_launcher_metadata_file(parent_out_dir, metadata)
 
 
 def child_long_options(script):
@@ -170,7 +166,7 @@ def child_long_options(script):
     except Exception:
         opts = set()
     else:
-        opts = set(re.findall(r"(?<![A-Za-z0-9_-])--[A-Za-z0-9][A-Za-z0-9_-]*", proc.stdout or ""))
+        opts = parse_child_long_options(proc.stdout)
     _CHILD_LONG_OPTIONS_CACHE[script_key] = set(opts)
     return opts
 

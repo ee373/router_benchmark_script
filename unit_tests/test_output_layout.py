@@ -15,6 +15,93 @@ from tests.run_router_bench_v4_tcp_scratch_max_sessions import (
 
 
 class OutputLayoutTests(unittest.TestCase):
+    def test_repeat_one_does_not_dispatch_or_create_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir) / "result"
+            with mock.patch("tests.lib.repeat.subprocess.run") as run_mock:
+                return_code = run_repeated_subprocesses(
+                    1,
+                    out_dir,
+                    argv=[],
+                    script_path=Path(__file__),
+                    cwd=Path(temp_dir),
+                )
+
+            self.assertIsNone(return_code)
+            run_mock.assert_not_called()
+            self.assertFalse(out_dir.exists())
+
+    def test_dispatch_forwards_child_arguments_and_overrides_repeat_and_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir) / "result"
+            commands = []
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                child_out_dir = Path(command[command.index("--out-dir") + 1])
+                child_out_dir.mkdir(parents=True, exist_ok=True)
+                (child_out_dir / "summary_all.csv").write_text(
+                    "value\nok\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0)
+
+            with mock.patch("tests.lib.repeat.subprocess.run", side_effect=fake_run):
+                return_code = run_repeated_subprocesses(
+                    2,
+                    out_dir,
+                    argv=["--repeat", "4", "--out-dir", "old", "--duration", "10"],
+                    script_path=Path(__file__),
+                    cwd=Path(temp_dir),
+                )
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(len(commands), 2)
+            for command in commands:
+                self.assertEqual(
+                    command[2:5],
+                    ["--duration", "10", "--repeat"],
+                )
+                self.assertEqual(command[5], "1")
+                self.assertEqual(command[6], "--out-dir")
+                self.assertEqual(Path(command[7]).parent, out_dir / DETAILS_DIRNAME)
+
+    def test_failed_repeat_preserves_partial_results_and_skips_aggregation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir) / "result"
+            call_count = 0
+
+            def fake_run(command, **_kwargs):
+                nonlocal call_count
+                call_count += 1
+                child_out_dir = Path(command[command.index("--out-dir") + 1])
+                child_out_dir.mkdir(parents=True, exist_ok=True)
+                (child_out_dir / "summary_all.csv").write_text(
+                    f"value\n{call_count}\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0 if call_count == 1 else 17)
+
+            with mock.patch("tests.lib.repeat.subprocess.run", side_effect=fake_run):
+                return_code = run_repeated_subprocesses(
+                    3,
+                    out_dir,
+                    argv=[],
+                    script_path=Path(__file__),
+                    cwd=Path(temp_dir),
+                )
+
+            self.assertEqual(return_code, 17)
+            self.assertTrue((out_dir / DETAILS_DIRNAME / "repeat_001" / "summary_all.csv").is_file())
+            self.assertTrue((out_dir / DETAILS_DIRNAME / "repeat_002" / "summary_all.csv").is_file())
+            self.assertFalse((out_dir / "summary_all.csv").exists())
+            metadata = json.loads(
+                (out_dir / DETAILS_DIRNAME / "repeat_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual([run["return_code"] for run in metadata["runs"]], [0, 17])
+
     def test_prepare_details_dir_creates_expected_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir) / "result"

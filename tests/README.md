@@ -39,6 +39,24 @@ Individual tests can also be executed directly when debugging a specific subsyst
 | `run_router_bench_v4_dns_latency.py` | DNS rate/cache/table benchmark with built-in dummy WAN-side DNS server. |
 | `run_router_bench_v4_dhcp_scratch.py` | DHCPv4 basic DORA latency, burst, and same-MAC reconnect benchmark using a scratch raw-socket client. |
 
+## Shared library responsibilities
+
+Common implementation lives under `tests/lib/` and is imported by launchers and
+benchmark scripts:
+
+| Module | Responsibility |
+|---|---|
+| `pci.py` | PCI BDF normalization, sysfs device/unbind paths, driver-link lookup, and sysfs writes. `network.py` keeps strict BDF validation; `trex.py` retains its historical permissive prefixing behavior. |
+| `refresh.py` | Shared endpoint logging, failure policy, CSV locking, and periodic worker lifecycle. `arp.py` and `ndp.py` retain their protocol-specific transmission and neighbor-resolution functions. |
+| `launcher.py` | Shared child-option parsing/validation/filtering, launcher test metadata entries, and metadata file writing. Launcher-specific selection, metadata keys, diagnostics, and child execution policy remain in each entry point. |
+| `common.py`, `repeat.py`, `output.py` | Shared timestamp/CSV helpers, repeated child execution and summary aggregation, and `details/` directory layout. CSV schemas and per-benchmark summary selections remain benchmark-specific. |
+| `network.py` | Namespace, interface, and kernel-driver operations. A benchmark should use only the preparation/cleanup APIs matching its own namespace topology and restore policy. |
+
+The refactoring intentionally leaves traffic generation, protocol checks,
+measurement timing, and benchmark-specific output schemas in their existing
+owners. See `REFACTORING_SPEC.md` for compatibility constraints and staged
+refactoring scope.
+
 ## Launcher order
 
 The launcher executes tests in this order:
