@@ -132,7 +132,16 @@ except Exception:
 _ASTF_DEFAULTS = _load_defaults("astf")
 
 
-def run_cps_search(client, target, raw_writer, args, repeat_index, out_dir):
+def run_cps_search(
+    client,
+    target,
+    raw_writer,
+    args,
+    repeat_index,
+    out_dir,
+    astf_server_ip=None,
+    astf_server_ip_range=None,
+):
     rows = []
     for cps in args.cps_steps:
         if cps > args.max_cps:
@@ -157,8 +166,16 @@ def run_cps_search(client, target, raw_writer, args, repeat_index, out_dir):
             interval_sec=args.preflight_probe_interval_sec,
             timeout_sec=args.preflight_timeout_sec,
             tcp_port=args.astf_tcp_port,
+            server_ip=astf_server_ip,
+            server_ip_range=astf_server_ip_range,
         )
-        profile = make_short_session_profile(target=target, cps=cps, tcp_port=args.astf_tcp_port)
+        profile = make_short_session_profile(
+            target=target,
+            cps=cps,
+            tcp_port=args.astf_tcp_port,
+            server_ip=astf_server_ip,
+            server_ip_range=astf_server_ip_range,
+        )
         stats = run_astf_profile(
             client=client,
             profile=profile,
@@ -360,7 +377,13 @@ def make_session_generation_overview(repeat_rows, args, repeat_index):
 
 
 
-def run_astf_cps_tests(target, out_dir, args):
+def run_astf_cps_tests(
+    target,
+    out_dir,
+    args,
+    astf_server_ip=None,
+    astf_server_ip_range=None,
+):
     add_trex_api_path()
     from trex.astf.api import ASTFClient
 
@@ -382,7 +405,14 @@ def run_astf_cps_tests(target, out_dir, args):
                 repeat_rows = []
                 try:
                     cps_rows = run_cps_search(
-                        client, target, raw_writer, args, r, out_dir
+                        client,
+                        target,
+                        raw_writer,
+                        args,
+                        r,
+                        out_dir,
+                        astf_server_ip=astf_server_ip,
+                        astf_server_ip_range=astf_server_ip_range,
                     )
                     summaries.extend(cps_rows)
                     repeat_rows.extend(cps_rows)

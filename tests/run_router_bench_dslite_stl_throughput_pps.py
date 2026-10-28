@@ -715,7 +715,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             udp_sport = lan_source_port
         return (
             Ether(src=mac_ctx["lan_src_mac"], dst=mac_ctx["lan_router_mac"])
-            / IP(src=target["lan_ip"], dst=target["server_ip"])
+            / IP(src=target["lan_ip"], dst=target["server_ipv4"])
             / UDP(sport=int(udp_sport), dport=int(udp_dport))
             / Raw(load=payload)
         )
@@ -732,7 +732,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
             payload = payload_for_l2_size(frame_size)
         return (
             Ether(src=mac_ctx["wan_src_mac"], dst=mac_ctx["wan_router_mac"])
-            / IP(src=target["server_ip"], dst=nat_external_ipv4)
+            / IP(src=target["server_ipv4"], dst=nat_external_ipv4)
             / UDP(sport=int(udp_sport), dport=int(nat_external_port))
             / Raw(load=payload)
         )
@@ -935,7 +935,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         for packet in parse_capture(captured, wan_port, marker):
             if (
                 is_nat_pool_address(packet[IP].src, target["nat_pool_cidr"])
-                and packet[IP].dst == target["server_ip"]
+                and packet[IP].dst == target["server_ipv4"]
                 and int(packet[UDP].dport) == UDP_PORT
             ):
                 matched.append(packet)
@@ -991,7 +991,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         for packet in parse_capture(captured, wan_port, marker):
             if (
                 is_nat_pool_address(packet[IP].src, target["nat_pool_cidr"])
-                and packet[IP].dst == target["server_ip"]
+                and packet[IP].dst == target["server_ipv4"]
                 and int(packet[UDP].dport) == UDP_PORT
             ):
                 matched.append(packet)
@@ -1050,7 +1050,7 @@ def run_stl_tests(target, out_dir, duration, repeat, rate_search, rate_steps, ra
         matched = []
         for packet in parse_capture(captured, lan_port, marker):
             if (
-                packet[IP].src == target["server_ip"]
+                packet[IP].src == target["server_ipv4"]
                 and packet[IP].dst == target["lan_ip"]
                 and int(packet[UDP].sport) == UDP_PORT
                 and int(packet[UDP].dport) == lan_source_port

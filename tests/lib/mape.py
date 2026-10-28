@@ -218,8 +218,13 @@ def validate_mape_profile(name, profile):
         raise ValueError(
             f"MAP-E profile {name!r} outer_ipv6_mtu must equal inner_ipv4_mtu + 40"
         )
-    if int(profile["tcp_mss"]) != inner_mtu - IPV4_HEADER_BYTES - TCP_HEADER_BYTES:
-        raise ValueError(f"MAP-E profile {name!r} tcp_mss does not match inner_ipv4_mtu")
+    max_tcp_mss = inner_mtu - IPV4_HEADER_BYTES - TCP_HEADER_BYTES
+    tcp_mss = int(profile["tcp_mss"])
+    if tcp_mss <= 0 or tcp_mss > max_tcp_mss:
+        raise ValueError(
+            f"MAP-E profile {name!r} tcp_mss must be between 1 and "
+            f"{max_tcp_mss} for inner_ipv4_mtu"
+        )
     return profile
 
 

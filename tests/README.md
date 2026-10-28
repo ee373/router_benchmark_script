@@ -34,6 +34,7 @@ Individual tests can also be executed directly when debugging a specific subsyst
 | `run_router_bench_v4_tcp_scratch_max_sessions.py` | TCP scratch maximum concurrent session benchmark without TRex. Included in the default set and `--run-all`. |
 | `run_router_bench_v4_astf_max_sessions.py` | Legacy TRex ASTF maximum concurrent session benchmark. Launcher execution requires `--run-astf-max-sessions`. |
 | `run_router_bench_v4_astf_sessions_cps.py` | TRex ASTF short-session CPS benchmark. Included in the default set and `--run-all`; can also be selected with `--run-astf-sessions-cps`. |
+| `run_router_bench_mape_astf_sessions_cps.py` | TRex ASTF MAP-E short-session TCP CPS benchmark. |
 | `run_router_bench_v4_astf_nat_stability.py` | TRex ASTF TCP/UDP NAT stability soak benchmark. |
 | `run_router_bench_v4_iperf3_latency.py` | Linux namespace based TCP/UDP L4 request-response latency benchmark with optional iperf3 load. |
 | `run_router_bench_v4_dns_latency.py` | DNS rate/cache/table benchmark with built-in dummy WAN-side DNS server. |
@@ -814,3 +815,16 @@ The scripts perform the needed transition automatically when profiles define bot
 ### Common test-start delay
 
 All standalone benchmark scripts wait 15 seconds after link readiness and before the first test traffic. Override with `--test-start-delay-sec`; `0` disables the wait. Helper/server/client internal roles do not wait independently.
+
+### MAP-E NAT stability soak
+
+Select with `sudo -n /usr/bin/python3 /opt/routerbench_dev/test_mape_speed.py --target i226_1g_mape --run-astf-natstability`.
+The test is excluded from the default plan and included in `--run-all`.
+`--soak-duration-sec` defaults to 3600 seconds per protocol (`tcp,udp`);
+launcher `--repeat` is not forwarded to this soak. For a short run, pass
+`--soak-duration-sec 20 --cycle-sessions 5 --cycle-cps 5`.
+The MAP-E profile supplies the single ASTF server IPv4 and TCP MSS (CLI `--tcp-mss` overrides it).
+WAN link addressing stays independent. TRex allocates client source ports internally;
+this test does not validate external PSID port allocation.
+Results include `summary_all.csv`, protocol summary/cycle/raw CSVs under `details/`,
+and `details/metadata.json` with the MAP-E profile and source-port notice.

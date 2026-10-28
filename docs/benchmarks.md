@@ -47,6 +47,7 @@ Individual tests can also be executed directly when debugging a specific subsyst
 | `tests/run_router_bench_dslite_astf_sessions_cps.py` | TRex ASTF DS-Lite short-session TCP CPS benchmark. |
 | `tests/run_router_bench_dslite_astf_nat_stability.py` | TRex ASTF DS-Lite TCP/UDP NAT stability soak benchmark. |
 | `tests/run_router_bench_dslite_iperf3_latency.py` | DS-Lite TCP/UDP request-response latency benchmark with iperf3 load. |
+| `tests/run_router_bench_mape_iperf3_latency.py` | MAP-E TCP/UDP request-response latency benchmark with iperf3 load. |
 | `tests/run_router_bench_v4_tcp_scratch_max_sessions.py` | TCP scratch maximum concurrent session benchmark without TRex. Included in the default set and `--run-all`. |
 | `tests/run_router_bench_v4_astf_max_sessions.py` | Legacy TRex ASTF maximum concurrent session benchmark. Launcher execution requires `--run-astf-max-sessions`. |
 | `tests/run_router_bench_v4_astf_sessions_cps.py` | TRex ASTF short-session CPS benchmark. Included in the default set and `--run-all`; can also be selected with `--run-astf-sessions-cps`. |
@@ -118,9 +119,10 @@ The separate DS-Lite launcher currently executes:
 ```text
 01_dslite_stl_throughput_pps
 02_dslite_tcp_scratch_max_sessions
-03_dslite_astf_sessions_cps
-04_dslite_astf_nat_stability     # --run-all or explicit selector only
-05_dslite_iperf3_l4rr_latency
+03_dslite_astf_sessions_cps_1ip
+04_dslite_astf_sessions_cps_253ip
+05_dslite_astf_nat_stability     # --run-all or explicit selector only
+06_dslite_iperf3_l4rr_latency
 special_dslite_tcp_source_port_scan  # explicit selector only; excluded from --run-all
 ```
 
@@ -129,6 +131,11 @@ inter-test recovery process returns a non-zero exit code. Each launcher records
 every failure, attempts all remaining selected tests, then prints
 `DONE WITH FAILURES` and returns exit code 1. A completely successful selection
 prints `DONE` and returns exit code 0.
+
+MAP-E and DS-Lite inter-test recovery use the same ASTF TCP round-trip preflight
+helper as their CPS measurements, with the previous CPS condition's server IP
+count, ASTF TCP port, and preflight settings. Basic IPv4 inter-test recovery
+continues to use the namespace-based TCP socket probe.
 
 The separate MAP-E launcher currently executes:
 
@@ -238,6 +245,71 @@ performs the downlink MAP-E encapsulation. The default PSID parameters produce
 The large inner frame is 1478 bytes including Ethernet FCS, corresponding to a
 1460-byte IPv4 packet. `outer_line_estimated_bps` includes the 40-byte MAP-E
 IPv6 header even though TRex itself handles only IPv4 packets.
+
+The MAP-E TCP scratch maximum-session benchmark can be selected explicitly:
+
+```bash
+sudo python3 test_mape_speed.py \
+  --target i226_1g_mape \
+  --run-tcp-scratch-max-sessions \
+  --repeat 1
+```
+
+It uses the profile PSID port set and server IPv4 network, with a planned
+capacity of 60,720 unique source-port/destination-address pairs for the current
+profile. It is not part of the default set; `--run-all` includes it. See
+[the MAP-E TCP scratch specification](./mape_tcp_scratch_max_sessions_spec.md)
+for address selection, MAP-E preflight, output, and validation requirements.
+
+The MAP-E ASTF short-session TCP CPS benchmark follows the DS-Lite ASTF
+measurement logic and distributes sessions across the MAP-E profile's
+`server_network` (excluding reserved `.0`, `.1`, and `.255` addresses).
+The default test plan runs it twice: first with 4 server IPv4 addresses, then
+with all 253 candidates. `--server-ip-count` selects the candidate count for a
+direct runner invocation. The 240-port PSID set is not itself a CPS ceiling,
+but port reuse and destination distribution may affect the observed success
+rate at high CPS. See
+[the MAP-E ASTF TCP CPS specification](./mape_astf_short_session_tcp_cps_spec.md)
+for the measurement conditions and validation requirements.
+
+Select it explicitly with:
+
+```bash
+sudo python3 test_mape_speed.py \
+  --target i226_1g_mape \
+  --run-astf-sessions-cps \
+  --duration 20 \
+  --repeat 1
+```
+
+The no-selector default plan and `--run-all` both include the 4-address and
+253-address runs. Selecting `--run-astf-sessions-cps` explicitly also runs
+both conditions.
+
+MAP-E TCP/UDP request-response latency is included in the default plan and
+`--run-all`, and can be selected on its own:
+
+```bash
+sudo python3 test_mape_speed.py \
+  --target i226_1g_mape \
+  --run-l4-latency \
+  --duration 30
+```
+
+The test reuses the shared namespace-based iperf3 latency runner. The WAN
+namespace keeps the profile's `wan_link_ip` as its interface address and adds
+`server_ipv4` as a separate `/32` endpoint, so the link gateway remains valid
+while the request-response and iperf3 servers bind to the MAP-E server address.
+TCP request-response sockets and TCP iperf3 load use the profile MSS (1380
+bytes by default); UDP is unaffected. See
+[the MAP-E L4 latency specification](./mape_iperf3_l4rr_latency_spec.md) for
+addressing, measurements, output, and validation requirements. Client source
+ports are selected from the target's MAP-E PSID port set. Before setting up
+the latency namespaces, the latency runner checks its echo endpoint before each
+phase. It does not run an ASTF recovery preflight. TCP
+request-response connection retries use subsequent PSID-valid source-port
+candidates when a connection attempt fails. Before each MAP-E L4 preflight
+retry, it also refreshes the LAN/WAN namespace ARP entries for their gateways.
 
 ## DS-Lite benchmarks
 
@@ -396,6 +468,12 @@ sudo python3 test_dslite_speed.py \
   --duration 20
 ```
 
+The default test plan runs DS-Lite ASTF CPS with both one and 253 server IP
+candidates. Candidates come from the profile's `server_network` and
+`server_ipv4` fields. The WAN gateway is excluded; for the default
+`198.51.100.0/24`, the 253-address range is `198.51.100.2` through
+`198.51.100.254`.
+
 Direct execution:
 
 ```bash
@@ -408,7 +486,10 @@ sudo python3 tests/run_router_bench_dslite_astf_sessions_cps.py \
 The test uses the existing IPv4 NAT ASTF short-session implementation. TRex
 generates a one-byte TCP request and response for every connection, then resets
 the client side. Each CPS step first performs a small TCP round-trip preflight
-and verifies successful establishment plus L7 bytes in both directions.
+and verifies successful establishment plus L7 bytes in both directions. The
+default launcher runs `--server-ip-count 1` and `--server-ip-count 253` as
+separate result conditions. The runner prints the selected count and range at
+startup and records both in metadata.
 
 The search uses the existing `cps_steps`, `stable_success_threshold`,
 `stable_loss_threshold`, and stop conditions. The result directory contains

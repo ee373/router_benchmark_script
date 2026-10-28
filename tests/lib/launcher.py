@@ -77,15 +77,18 @@ def filter_child_passthrough_args(passthrough_args, accepted_options):
 
 
 def launcher_test_entries(out_dir, enabled_tests, script_dir):
-    return [
-        {
+    entries = []
+    for item in enabled_tests:
+        entry = {
             "key": item["key"],
             "name": item["name"],
             "script": str(item["script"].relative_to(script_dir)),
             "out_dir": str((out_dir / item["out_dir_name"]).resolve()),
         }
-        for item in enabled_tests
-    ]
+        if item.get("args"):
+            entry["args"] = list(item["args"])
+        entries.append(entry)
+    return entries
 
 
 def write_launcher_metadata_file(out_dir, metadata, default=None):

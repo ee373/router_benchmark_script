@@ -75,6 +75,30 @@ def filter_passthrough_args(script, passthrough_args):
     return filter_child_passthrough_args(passthrough_args, accepted)
 
 
+def recovery_astf_args(previous_item, passthrough_args):
+    options = {
+        "--server-ip-count",
+        "--astf-tcp-port",
+        "--preflight-success-consecutive",
+        "--preflight-probe-interval-sec",
+        "--preflight-timeout-sec",
+    }
+    values = {}
+    for arguments in (previous_item.get("args", []), passthrough_args):
+        index = 0
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument.startswith("--") and "=" in argument:
+                option, value = argument.split("=", 1)
+                if option in options:
+                    values[option] = value
+            elif argument in options and index + 1 < len(arguments):
+                values[argument] = arguments[index + 1]
+                index += 1
+            index += 1
+    return [value for option, item in values.items() for value in (option, item)]
+
+
 def write_launcher_metadata(out_dir, args, enabled_tests, passthrough_args, selection_mode):
     metadata = {
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
@@ -122,7 +146,7 @@ def main():
         "--repeat",
         type=argparse_repeat,
         default=DEFAULT_REPEAT,
-        help="Repeat the MAP-E throughput/PPS benchmark. Default: 1.",
+        help="Repeat each selected MAP-E benchmark. Default: 1.",
     )
     parser.add_argument(
         "--test-start-delay-sec",
@@ -159,6 +183,25 @@ def main():
         action="store_true",
         help="Run MAP-E IPv4 throughput and small-packet PPS.",
     )
+    selection.add_argument(
+        "--run-tcp-scratch-max-sessions",
+        action="store_true",
+        help="Run the MAP-E TCP scratch maximum concurrent session benchmark.",
+    )
+    selection.add_argument(
+        "--run-astf-sessions-cps",
+        action="store_true",
+        help="Run the MAP-E ASTF short-session TCP CPS benchmark.",
+    )
+    selection.add_argument(
+        "--run-astf-natstability", action="store_true",
+        help="Run MAP-E ASTF TCP/UDP NAT stability soak (duration per protocol; no repeat).",
+    )
+    selection.add_argument(
+        "--run-l4-latency",
+        action="store_true",
+        help="Run MAP-E TCP/UDP request-response latency under iperf3 load.",
+    )
     args, passthrough_args = parser.parse_known_args()
 
     individual_selected = any(
@@ -194,6 +237,25 @@ def main():
             for item in TEST_PLAN
             if bool(item.get("default", False))
         ]
+    if any(item["key"] == "mape_tcp_scratch_max_sessions" for item in enabled_tests):
+        unsupported_options = {
+            "--lan-source-port-range",
+            "--source-start-port",
+            "--source-end-port",
+        }
+        supplied_options = {
+            argument.split("=", 1)[0]
+            for argument in passthrough_args
+            if argument.startswith("--")
+        }
+        if args.lan_source_port_range is not None or supplied_options.intersection(
+            unsupported_options
+        ):
+            raise SystemExit(
+                "ERROR: MAP-E TCP scratch uses the profile PSID source-port set; "
+                "--lan-source-port-range, --source-start-port, and "
+                "--source-end-port cannot be used with this test."
+            )
     validate_passthrough_args(passthrough_args, enabled_tests)
 
     parent_out_dir = Path(args.out_dir) if args.out_dir else build_default_out_dir(args.target)
@@ -229,6 +291,9 @@ def main():
                 "--probe-interval-sec", str(args.inter_test_probe_interval_sec),
                 "--success-consecutive", str(args.inter_test_success_consecutive),
             ]
+            recovery_cmd.extend(
+                recovery_astf_args(previous_item, passthrough_args)
+            )
             if args.lan_source_port_range is not None:
                 recovery_cmd.extend([
                     "--lan-source-port-range",
@@ -260,6 +325,7 @@ def main():
             "--test-start-delay-sec",
             str(args.test_start_delay_sec),
         ]
+        cmd.extend(item.get("args", []))
         if "--repeat" in child_long_options(item["script"]):
             cmd.extend(["--repeat", str(args.repeat)])
         if (

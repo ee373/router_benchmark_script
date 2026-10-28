@@ -28,7 +28,8 @@ REQUIRED_PROFILE_FIELDS = (
     "wan_prefix_len",
     "wan_gateway_ip",
     "wan_arp_target",
-    "server_ip",
+    "server_network",
+    "server_ipv4",
     "nat_external_ip_mode",
     "nat_pool_cidr",
     "nat_external_port_mode",
@@ -53,9 +54,32 @@ def validate_dslite_profile(name, profile):
         raise ValueError(f"DS-Lite profile {name!r} must use different LAN and WAN ports")
     if float(profile["line_rate_gbps"]) <= 0:
         raise ValueError(f"DS-Lite profile {name!r} line_rate_gbps must be positive")
-    for key in ("lan_ip", "lan_gw", "wan_link_ip", "wan_gateway_ip", "wan_arp_target", "server_ip"):
+    for key in (
+        "lan_ip",
+        "lan_gw",
+        "wan_link_ip",
+        "wan_gateway_ip",
+        "wan_arp_target",
+        "server_ipv4",
+    ):
         if ip_address(profile[key]).version != 4:
             raise ValueError(f"DS-Lite profile {name!r} {key} must be IPv4")
+    server_network = ip_network(profile["server_network"], strict=True)
+    if server_network.version != 4:
+        raise ValueError(f"DS-Lite profile {name!r} server_network must be IPv4")
+    server_address = ip_address(profile["server_ipv4"])
+    if server_address not in server_network:
+        raise ValueError(
+            f"DS-Lite profile {name!r} server_ipv4 must be in server_network"
+        )
+    if server_address in (server_network.network_address, server_network.broadcast_address):
+        raise ValueError(
+            f"DS-Lite profile {name!r} server_ipv4 must be a usable host address"
+        )
+    if server_address == ip_address(profile["wan_gateway_ip"]):
+        raise ValueError(
+            f"DS-Lite profile {name!r} server_ipv4 must not be the WAN gateway"
+        )
     pool = ip_network(profile["nat_pool_cidr"], strict=False)
     if pool.version != 4:
         raise ValueError(f"DS-Lite profile {name!r} nat_pool_cidr must be IPv4")
@@ -82,6 +106,7 @@ def build_trex_target(profile):
     target["wan_ip"] = profile["wan_link_ip"]
     target["wan_gw"] = profile["wan_arp_target"]
     target["router_wan_ip"] = profile["wan_gateway_ip"]
+    target["server_ip"] = profile["server_ipv4"]
     return target
 
 

@@ -213,6 +213,9 @@ BENCHMARK_TITLE = "IPv4 NAT latency benchmark using iperf3 + TCP/UDP request-res
 DEFAULT_OUTPUT_PREFIX = "iperf3_l4rr_latency"
 METADATA_MODE = "iperf3_l4rr_latency"
 METADATA_NOTES_EXTRA = []
+DEFAULT_TCP_MSS = None
+SOURCE_PORTS = ()
+_SOURCE_PORT_INDEX = 0
 DEFAULT_LATENCY_DURATION_SEC = float(_L4_DEFAULTS["duration_sec"])
 DEFAULT_LATENCY_INTERVAL_SEC = float(_L4_DEFAULTS["interval_sec"])
 DEFAULT_LATENCY_PAYLOAD_SIZE_BYTES = int(_L4_DEFAULTS["payload_size_bytes"])
@@ -256,6 +259,7 @@ SUMMARY_FIELDS = [
     "lan_ip",
     "lan_gw",
     "wan_ip",
+    "wan_interface_ip",
     "wan_gw",
     "router_wan_ip",
     "latency_protocol",
@@ -263,12 +267,15 @@ SUMMARY_FIELDS = [
     "latency_interval_sec",
     "latency_payload_size_bytes",
     "latency_timeout_sec",
+    "latency_tcp_mss",
+    "latency_tcp_mss_effective",
     "load_protocol",
     "load_direction",
     "load_rate",
     "load_percent",
     "computed_load_bps",
     "iperf3_parallel",
+    "iperf3_tcp_mss",
     "duration_sec",
     "samples_requested",
     "samples_received",
@@ -426,9 +433,51 @@ def socket_family(address):
     return socket.AF_INET6 if ":" in str(address) else socket.AF_INET
 
 
-def l4rr_tcp_server(bind_ip, port):
+def set_tcp_mss(sock_obj, tcp_mss):
+    if tcp_mss:
+        sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, int(tcp_mss))
+
+
+def next_source_port(count=1):
+    """Choose a configured source port and, when needed, a consecutive block."""
+    candidates = ordered_source_ports(count, advance=True)
+    return candidates[0] if candidates else None
+
+
+def ordered_source_ports(count=1, *, advance=False, advance_step=1):
+    global _SOURCE_PORT_INDEX
+    if not SOURCE_PORTS:
+        return ()
+    count = int(count)
+    if count <= 0:
+        raise ValueError("source-port count must be positive")
+    valid_ports = {int(port) for port in SOURCE_PORTS}
+    candidates = [
+        int(port)
+        for port in SOURCE_PORTS
+        if all(int(port) + offset in valid_ports for offset in range(count))
+    ]
+    if not candidates:
+        raise ValueError(
+            f"configured source-port set has no {count}-port consecutive range"
+        )
+
+    start_index = next(
+        (index for index, port in enumerate(candidates) if port >= 32768),
+        0,
+    )
+    if advance:
+        start_index = (
+            start_index + _SOURCE_PORT_INDEX
+        ) % len(candidates)
+        _SOURCE_PORT_INDEX += int(advance_step)
+    return tuple(candidates[start_index:] + candidates[:start_index])
+
+
+def l4rr_tcp_server(bind_ip, port, tcp_mss=0):
     srv = socket.socket(socket_family(bind_ip), socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    set_tcp_mss(srv, tcp_mss)
     srv.bind((bind_ip, int(port)))
     srv.listen(32)
     srv.settimeout(0.5)
@@ -440,6 +489,7 @@ def l4rr_tcp_server(bind_ip, port):
             continue
         except KeyboardInterrupt:
             break
+        set_tcp_mss(conn, tcp_mss)
         conn.settimeout(1.0)
         with conn:
             print(f"accepted TCP client {addr}", file=sys.stderr, flush=True)
@@ -479,9 +529,13 @@ def l4rr_udp_server(bind_ip, port):
     srv.close()
 
 
-def connect_tcp_with_retry(server_ip, port, source_ip, connect_timeout_sec, retry_interval_sec=0.1):
+def connect_tcp_with_retry(
+    server_ip, port, source_ip, connect_timeout_sec, retry_interval_sec=0.1,
+    tcp_mss=0, source_port=None, source_ports=(),
+):
     deadline = time.monotonic() + float(connect_timeout_sec)
     last_exc = None
+    attempt = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -490,9 +544,17 @@ def connect_tcp_with_retry(server_ip, port, source_ip, connect_timeout_sec, retr
             raise TimeoutError("TCP connect retry timeout")
         sock_obj = socket.socket(socket_family(server_ip), socket.SOCK_STREAM)
         try:
-            if source_ip:
-                sock_obj.bind((source_ip, 0))
-            sock_obj.settimeout(min(0.5, max(0.05, remaining)))
+            set_tcp_mss(sock_obj, tcp_mss)
+            candidate_port = (
+                source_ports[attempt % len(source_ports)]
+                if source_ports
+                else source_port
+            )
+            if source_ip or candidate_port:
+                sock_obj.bind(
+                    (source_ip or "0.0.0.0", int(candidate_port or 0))
+                )
+            sock_obj.settimeout(min(0.5, remaining))
             sock_obj.connect((server_ip, int(port)))
             return sock_obj
         except OSError as exc:
@@ -501,13 +563,32 @@ def connect_tcp_with_retry(server_ip, port, source_ip, connect_timeout_sec, retr
                 sock_obj.close()
             except Exception:
                 pass
-            time.sleep(min(float(retry_interval_sec), max(0.0, deadline - time.monotonic())))
+            attempt += 1
+            time.sleep(
+                min(
+                    float(retry_interval_sec),
+                    max(0.0, deadline - time.monotonic()),
+                )
+            )
 
 
-def l4rr_client_tcp(server_ip, port, source_ip, duration_sec, interval_sec, payload_size, timeout_sec, connect_timeout_sec):
+def l4rr_client_tcp(
+    server_ip, port, source_ip, duration_sec, interval_sec, payload_size,
+    timeout_sec, connect_timeout_sec, tcp_mss=0, source_port=None,
+    source_ports=(),
+):
     samples = []
     requested = int(math.ceil(float(duration_sec) / float(interval_sec)))
-    sock_obj = connect_tcp_with_retry(server_ip, port, source_ip, connect_timeout_sec)
+    sock_obj = connect_tcp_with_retry(
+        server_ip,
+        port,
+        source_ip,
+        connect_timeout_sec,
+        tcp_mss=tcp_mss,
+        source_port=source_port,
+        source_ports=source_ports,
+    )
+    actual_source_port = sock_obj.getsockname()[1]
     sock_obj.settimeout(float(timeout_sec))
     try:
         for seq in range(1, requested + 1):
@@ -548,16 +629,25 @@ def l4rr_client_tcp(server_ip, port, source_ip, duration_sec, interval_sec, payl
             if delay > 0:
                 time.sleep(delay)
     finally:
-        sock_obj.close()
-    return samples, requested
+        try:
+            effective_mss = sock_obj.getsockopt(
+                socket.IPPROTO_TCP, socket.TCP_MAXSEG
+            )
+        finally:
+            sock_obj.close()
+    return samples, requested, effective_mss, actual_source_port
 
 
-def l4rr_client_udp(server_ip, port, source_ip, duration_sec, interval_sec, payload_size, timeout_sec):
+def l4rr_client_udp(
+    server_ip, port, source_ip, duration_sec, interval_sec, payload_size,
+    timeout_sec, source_port=None,
+):
     samples = []
     requested = int(math.ceil(float(duration_sec) / float(interval_sec)))
     sock_obj = socket.socket(socket_family(server_ip), socket.SOCK_DGRAM)
-    if source_ip:
-        sock_obj.bind((source_ip, 0))
+    if source_ip or source_port:
+        sock_obj.bind((source_ip or "0.0.0.0", int(source_port or 0)))
+    actual_source_port = sock_obj.getsockname()[1]
     sock_obj.settimeout(float(timeout_sec))
     try:
         for seq in range(1, requested + 1):
@@ -605,7 +695,7 @@ def l4rr_client_udp(server_ip, port, source_ip, duration_sec, interval_sec, payl
                 time.sleep(delay)
     finally:
         sock_obj.close()
-    return samples, requested
+    return samples, requested, actual_source_port
 
 
 def run_internal_l4rr_server(argv):
@@ -613,9 +703,10 @@ def run_internal_l4rr_server(argv):
     parser.add_argument("--protocol", choices=["tcp", "udp"], required=True)
     parser.add_argument("--bind-ip", required=True)
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--tcp-mss", type=parse_positive_int, default=0)
     args = parser.parse_args(argv)
     if args.protocol == "tcp":
-        l4rr_tcp_server(args.bind_ip, args.port)
+        l4rr_tcp_server(args.bind_ip, args.port, args.tcp_mss)
     else:
         l4rr_udp_server(args.bind_ip, args.port)
 
@@ -631,19 +722,29 @@ def run_internal_l4rr_client(argv):
     parser.add_argument("--payload-size-bytes", type=int, required=True)
     parser.add_argument("--timeout-sec", type=float, required=True)
     parser.add_argument("--connect-timeout-sec", type=float, default=DEFAULT_LATENCY_CONNECT_TIMEOUT_SEC)
+    parser.add_argument("--tcp-mss", type=parse_positive_int, default=0)
+    parser.add_argument("--source-port", type=parse_positive_int, default=0)
+    parser.add_argument("--source-ports", default="")
     args = parser.parse_args(argv)
+    source_ports = tuple(
+        int(port) for port in args.source_ports.split(",") if port
+    )
     started = time.time()
+    effective_mss = ""
+    actual_source_port = args.source_port or ""
     try:
         if args.protocol == "tcp":
-            samples, requested = l4rr_client_tcp(
+            samples, requested, effective_mss, actual_source_port = l4rr_client_tcp(
                 args.server_ip, args.port, args.source_ip, args.duration_sec,
                 args.interval_sec, args.payload_size_bytes, args.timeout_sec,
-                args.connect_timeout_sec,
+                args.connect_timeout_sec, args.tcp_mss, args.source_port or None,
+                source_ports,
             )
         else:
-            samples, requested = l4rr_client_udp(
+            samples, requested, actual_source_port = l4rr_client_udp(
                 args.server_ip, args.port, args.source_ip, args.duration_sec,
                 args.interval_sec, args.payload_size_bytes, args.timeout_sec,
+                args.source_port or None,
             )
         result = "PASS" if any(sample.get("result") == "PASS" for sample in samples) else "FAIL"
         output = {
@@ -652,11 +753,14 @@ def run_internal_l4rr_client(argv):
             "server_ip": args.server_ip,
             "source_ip": args.source_ip,
             "port": args.port,
+            "source_port": actual_source_port,
             "duration_sec_requested": args.duration_sec,
             "duration_sec_elapsed": time.time() - started,
             "interval_sec": args.interval_sec,
             "payload_size_bytes": args.payload_size_bytes,
             "timeout_sec": args.timeout_sec,
+            "tcp_mss": args.tcp_mss if args.protocol == "tcp" else "",
+            "tcp_mss_effective": effective_mss,
             "samples_requested": requested,
             "samples": samples,
         }
@@ -669,11 +773,14 @@ def run_internal_l4rr_client(argv):
             "server_ip": args.server_ip,
             "source_ip": args.source_ip,
             "port": args.port,
+            "source_port": actual_source_port,
             "duration_sec_requested": args.duration_sec,
             "duration_sec_elapsed": time.time() - started,
             "interval_sec": args.interval_sec,
             "payload_size_bytes": args.payload_size_bytes,
             "timeout_sec": args.timeout_sec,
+            "tcp_mss": args.tcp_mss if args.protocol == "tcp" else "",
+            "tcp_mss_effective": effective_mss,
             "samples_requested": int(math.ceil(float(args.duration_sec) / float(args.interval_sec))),
             "samples": [],
             "error": str(exc),
@@ -705,6 +812,8 @@ def start_l4rr_server(args, target, out_dir, phase):
         "--bind-ip", target["wan_ip"],
         "--port", str(args.latency_port),
     ])
+    if args.latency_protocol == "tcp" and args.tcp_mss:
+        cmd.extend(["--tcp-mss", str(args.tcp_mss)])
     (out_dir / f"l4rr_server_{phase}.cmd.txt").write_text(
         " ".join(shlex.quote(str(x)) for x in cmd) + "\n",
         encoding="utf-8",
@@ -734,6 +843,20 @@ def build_l4rr_client_command(args, target, duration_sec=None, interval_sec=None
         "--timeout-sec", str(args.latency_timeout_sec),
         "--connect-timeout-sec", str(args.latency_connect_timeout_sec),
     ]
+    if args.latency_protocol == "tcp" and args.tcp_mss:
+        cmd.extend(["--tcp-mss", str(args.tcp_mss)])
+    source_ports = ordered_source_ports(
+        advance=True,
+        advance_step=4 if args.latency_protocol == "tcp" else 1,
+    )
+    if source_ports:
+        if args.latency_protocol == "tcp":
+            cmd.extend([
+                "--source-ports",
+                ",".join(str(port) for port in source_ports),
+            ])
+        else:
+            cmd.extend(["--source-port", str(source_ports[0])])
     return ns_cmd(args.lan_ns, cmd)
 
 
@@ -759,11 +882,19 @@ def l4rr_client_result_ok(json_path):
     return bool(samples) and all(sample.get("result") == "PASS" for sample in samples)
 
 
-def run_l4rr_preflight(args, target, out_dir, phase):
+def run_l4rr_preflight(args, target, out_dir, phase, neighbor_refresher=None):
     if not args.l4rr_preflight:
         return
 
     def probe(attempt):
+        if (
+            neighbor_refresher is not None
+            and target.get("benchmark_mode") == "mape"
+        ):
+            neighbor_refresher.refresh_now(
+                f"l4rr_preflight_{phase}_attempt_{attempt}",
+                required=True,
+            )
         preflight_json = out_dir / f"l4rr_preflight_{phase}_attempt{attempt}.json"
         preflight_stderr = out_dir / f"l4rr_preflight_{phase}_attempt{attempt}.stderr.log"
         cmd = build_l4rr_client_command(
@@ -816,20 +947,29 @@ def run_l4rr_preflight(args, target, out_dir, phase):
         return None
 
 
-def run_l4rr_phase(phase, args, target, out_dir, *, tool_load="none", load_percent="", computed_load_bps=""):
+def run_l4rr_phase(
+    phase, args, target, out_dir, *, tool_load="none", load_percent="",
+    computed_load_bps="", neighbor_refresher=None,
+):
     server_proc, server_stdout, server_stderr = start_l4rr_server(args, target, out_dir, phase)
     client_json = out_dir / f"l4rr_client_{phase}.json"
     client_stderr = out_dir / f"l4rr_client_{phase}.stderr.log"
-    client_cmd = build_l4rr_client_command(args, target)
-    (out_dir / f"l4rr_client_{phase}.cmd.txt").write_text(
-        " ".join(shlex.quote(str(x)) for x in client_cmd) + "\n",
-        encoding="utf-8",
-    )
     proc = None
     try:
         time.sleep(args.latency_server_start_delay_sec)
         ensure_process_running(server_proc, "l4rr server")
-        run_l4rr_preflight(args, target, out_dir, phase)
+        run_l4rr_preflight(
+            args,
+            target,
+            out_dir,
+            phase,
+            neighbor_refresher=neighbor_refresher,
+        )
+        client_cmd = build_l4rr_client_command(args, target)
+        (out_dir / f"l4rr_client_{phase}.cmd.txt").write_text(
+            " ".join(shlex.quote(str(x)) for x in client_cmd) + "\n",
+            encoding="utf-8",
+        )
         with open(client_json, "w", encoding="utf-8") as out_f, open(client_stderr, "w", encoding="utf-8") as err_f:
             proc = subprocess.Popen(client_cmd, stdout=out_f, stderr=err_f, text=True)
             wait_for_process_exit(proc, args.latency_duration_sec + args.latency_timeout_sec + args.latency_connect_timeout_sec + 10.0, "l4rr client")
@@ -882,6 +1022,7 @@ def run_l4rr_phase(phase, args, target, out_dir, *, tool_load="none", load_perce
         "lan_ip": target["lan_ip"],
         "lan_gw": target["lan_gw"],
         "wan_ip": target["wan_ip"],
+        "wan_interface_ip": target.get("wan_iface_ip", target["wan_ip"]),
         "wan_gw": target["wan_gw"],
         "router_wan_ip": target["router_wan_ip"],
         "latency_protocol": args.latency_protocol,
@@ -889,12 +1030,21 @@ def run_l4rr_phase(phase, args, target, out_dir, *, tool_load="none", load_perce
         "latency_interval_sec": args.latency_interval_sec,
         "latency_payload_size_bytes": args.latency_payload_size_bytes,
         "latency_timeout_sec": args.latency_timeout_sec,
+        "latency_tcp_mss": (
+            args.tcp_mss if args.latency_protocol == "tcp" else ""
+        ),
+        "latency_tcp_mss_effective": (
+            data.get("tcp_mss_effective", "")
+            if args.latency_protocol == "tcp" and isinstance(data, dict)
+            else ""
+        ),
         "load_protocol": "none",
         "load_direction": "none",
         "load_rate": "none",
         "load_percent": load_percent,
         "computed_load_bps": computed_load_bps,
         "iperf3_parallel": "",
+        "iperf3_tcp_mss": "",
         "duration_sec": data.get("duration_sec_elapsed", args.latency_duration_sec) if isinstance(data, dict) else args.latency_duration_sec,
         "samples_requested": requested,
         "samples_received": len(ok_samples),
@@ -959,7 +1109,29 @@ def build_iperf3_client_command(args, target, duration_sec, load_rate):
         cmd.append("--bidir")
 
     if args.iperf3_extra_args:
-        cmd.extend(shlex.split(args.iperf3_extra_args))
+        extra_args = shlex.split(args.iperf3_extra_args)
+        if SOURCE_PORTS and any(
+            item == "--cport" or item.startswith("--cport=")
+            for item in extra_args
+        ):
+            raise ValueError(
+                "--iperf3-extra-args must not override profile source-port selection"
+            )
+        if args.load_protocol == "tcp" and args.tcp_mss and any(
+            item in ("-M", "--set-mss")
+            or item.startswith("--set-mss=")
+            or (item.startswith("-M") and item != "-M")
+            for item in extra_args
+        ):
+            raise ValueError(
+                "--iperf3-extra-args must not override the configured TCP MSS"
+            )
+        cmd.extend(extra_args)
+    if args.load_protocol == "tcp" and args.tcp_mss:
+        cmd.extend(["-M", str(args.tcp_mss)])
+    source_port = next_source_port(args.iperf3_parallel)
+    if source_port is not None:
+        cmd.extend(["--cport", str(source_port)])
     return ns_cmd(args.lan_ns, cmd)
 
 
@@ -1050,6 +1222,7 @@ def build_l4rr_summary_from_json(phase, args, target, out_dir, data, proc_return
         "lan_ip": target["lan_ip"],
         "lan_gw": target["lan_gw"],
         "wan_ip": target["wan_ip"],
+        "wan_interface_ip": target.get("wan_iface_ip", target["wan_ip"]),
         "wan_gw": target["wan_gw"],
         "router_wan_ip": target["router_wan_ip"],
         "latency_protocol": args.latency_protocol,
@@ -1057,12 +1230,25 @@ def build_l4rr_summary_from_json(phase, args, target, out_dir, data, proc_return
         "latency_interval_sec": args.latency_interval_sec,
         "latency_payload_size_bytes": args.latency_payload_size_bytes,
         "latency_timeout_sec": args.latency_timeout_sec,
+        "latency_tcp_mss": (
+            args.tcp_mss if args.latency_protocol == "tcp" else ""
+        ),
+        "latency_tcp_mss_effective": (
+            data.get("tcp_mss_effective", "")
+            if args.latency_protocol == "tcp" and isinstance(data, dict)
+            else ""
+        ),
         "load_protocol": "none" if is_idle else args.load_protocol,
         "load_direction": "none" if is_idle else args.load_direction,
         "load_rate": "none" if is_idle else load_rate,
         "load_percent": load_percent if load_percent != "" else (0 if is_idle else ""),
         "computed_load_bps": computed_load_bps if computed_load_bps != "" else (0 if is_idle else ""),
         "iperf3_parallel": "" if is_idle else args.iperf3_parallel,
+        "iperf3_tcp_mss": (
+            args.tcp_mss
+            if not is_idle and args.load_protocol == "tcp"
+            else ""
+        ),
         "duration_sec": data.get("duration_sec_elapsed", args.latency_duration_sec) if isinstance(data, dict) else args.latency_duration_sec,
         "samples_requested": requested,
         "samples_received": len(ok_samples),
@@ -1082,7 +1268,10 @@ def build_l4rr_summary_from_json(phase, args, target, out_dir, data, proc_return
     return summary
 
 
-def run_loaded_phase(phase, args, target, out_dir, *, load_rate, load_percent, computed_load_bps):
+def run_loaded_phase(
+    phase, args, target, out_dir, *, load_rate, load_percent,
+    computed_load_bps, neighbor_refresher=None,
+):
     l4_server_proc, l4_server_stdout, l4_server_stderr = start_l4rr_server(args, target, out_dir, phase)
     iperf_server_proc, iperf_server_stdout, iperf_server_stderr, _server_json = start_iperf3_server(args, target, out_dir, phase)
     client_json = out_dir / f"iperf3_client_{phase}.json"
@@ -1095,7 +1284,13 @@ def run_loaded_phase(phase, args, target, out_dir, *, load_rate, load_percent, c
         time.sleep(max(args.latency_server_start_delay_sec, args.iperf3_server_start_delay_sec))
         ensure_process_running(l4_server_proc, "l4rr server")
         ensure_process_running(iperf_server_proc, "iperf3 server")
-        run_l4rr_preflight(args, target, out_dir, phase)
+        run_l4rr_preflight(
+            args,
+            target,
+            out_dir,
+            phase,
+            neighbor_refresher=neighbor_refresher,
+        )
         load_duration = args.latency_duration_sec + args.load_warmup_sec + args.load_cooldown_sec
         client_cmd = build_iperf3_client_command(args, target, load_duration, load_rate)
         (out_dir / f"iperf3_client_{phase}.cmd.txt").write_text(
@@ -1215,6 +1410,7 @@ def make_delta_row(idle_row, loaded_row, args, target):
         "lan_ip": target["lan_ip"],
         "lan_gw": target["lan_gw"],
         "wan_ip": target["wan_ip"],
+        "wan_interface_ip": target.get("wan_iface_ip", target["wan_ip"]),
         "wan_gw": target["wan_gw"],
         "router_wan_ip": target["router_wan_ip"],
         "latency_protocol": args.latency_protocol,
@@ -1222,12 +1418,25 @@ def make_delta_row(idle_row, loaded_row, args, target):
         "latency_interval_sec": args.latency_interval_sec,
         "latency_payload_size_bytes": args.latency_payload_size_bytes,
         "latency_timeout_sec": args.latency_timeout_sec,
+        "latency_tcp_mss": (
+            args.tcp_mss if args.latency_protocol == "tcp" else ""
+        ),
+        "latency_tcp_mss_effective": (
+            loaded_row.get("latency_tcp_mss_effective", "")
+            if loaded_row
+            else ""
+        ),
         "load_protocol": loaded_row.get("load_protocol", args.load_protocol) if loaded_row else args.load_protocol,
         "load_direction": loaded_row.get("load_direction", args.load_direction) if loaded_row else args.load_direction,
         "load_rate": loaded_row.get("load_rate", "") if loaded_row else "",
         "load_percent": loaded_row.get("load_percent", "") if loaded_row else "",
         "computed_load_bps": loaded_row.get("computed_load_bps", "") if loaded_row else "",
         "iperf3_parallel": args.iperf3_parallel,
+        "iperf3_tcp_mss": (
+            loaded_row.get("iperf3_tcp_mss", "")
+            if loaded_row
+            else (args.tcp_mss if args.load_protocol == "tcp" else "")
+        ),
         "duration_sec": args.latency_duration_sec,
         "idle_rtt_avg_ms": idle_avg if idle_avg is not None else "",
         "loaded_rtt_avg_ms": loaded_avg if loaded_avg is not None else "",
@@ -1263,6 +1472,10 @@ def write_metadata(out_dir, args, target):
         "Default phases are 0%, 10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90%, 95%, and 99%. The 0% phase is recorded as idle. Percent-based load is calculated from target profile line_rate_gbps.",
         "ICMP ping is not used for latency measurement in this script.",
     ]
+    if args.tcp_mss:
+        notes.append(
+            f"TCP MSS {args.tcp_mss} is applied to TCP request-response sockets and TCP iperf3 load."
+        )
     notes.extend(METADATA_NOTES_EXTRA)
     metadata = {
         "created_at": ts_iso(),
@@ -1326,6 +1539,12 @@ def main():
     parser.add_argument("--latency-payload-size-bytes", dest="latency_payload_size_bytes", type=parse_positive_int, default=DEFAULT_LATENCY_PAYLOAD_SIZE_BYTES)
     parser.add_argument("--ping-size-bytes", dest="latency_payload_size_bytes", type=parse_positive_int, help=argparse.SUPPRESS)
     parser.add_argument("--latency-timeout-sec", type=parse_positive_float, default=DEFAULT_LATENCY_TIMEOUT_SEC)
+    parser.add_argument(
+        "--tcp-mss",
+        type=parse_positive_int,
+        default=DEFAULT_TCP_MSS,
+        help="Set TCP MSS for TCP request-response sockets and TCP iperf3 load. Default: unset.",
+    )
     parser.add_argument("--latency-connect-timeout-sec", type=parse_positive_float, default=DEFAULT_LATENCY_CONNECT_TIMEOUT_SEC)
     parser.add_argument("--latency-server-start-delay-sec", type=parse_non_negative_float, default=_L4_DEFAULTS["latency_server_start_delay_sec"])
     parser.add_argument("--l4rr-preflight", dest="l4rr_preflight", action="store_true", default=_L4_DEFAULTS["preflight"], help="Run a short TCP/UDP request-response preflight before each measured phase. Enabled by default.")
@@ -1438,6 +1657,10 @@ def main():
         print(f"Kernel bind     : {'auto' if args.auto_kernel_bind else 'disabled'}")
         print(f"LAN endpoint    : {target['lan_ip']} gw {target['lan_gw']}")
         print(f"WAN endpoint    : {target['wan_ip']} gw {target['router_wan_ip']}")
+        if target.get("wan_iface_ip") and target["wan_iface_ip"] != target["wan_ip"]:
+            print(f"WAN iface IP    : {target['wan_iface_ip']}")
+        if args.tcp_mss:
+            print(f"TCP MSS         : {args.tcp_mss} (TCP request-response and TCP iperf3)")
         print(f"Latency protocol: {args.latency_protocol.upper()} port={args.latency_port}")
         print(f"Latency duration: {args.latency_duration_sec:g}s")
         print(f"Latency interval: {args.latency_interval_sec:g}s")
@@ -1489,6 +1712,7 @@ def main():
                         tool_load="none",
                         load_percent=0,
                         computed_load_bps=0,
+                        neighbor_refresher=neighbor_refresher,
                     )
                     idle_row["repeat"] = repeat_index
                     rows.append(idle_row)
@@ -1520,6 +1744,7 @@ def main():
                             load_rate=load_rate,
                             load_percent=load_percent,
                             computed_load_bps=computed_load_bps,
+                            neighbor_refresher=neighbor_refresher,
                         )
                         loaded_row["repeat"] = repeat_index
                         rows.append(loaded_row)

@@ -75,6 +75,30 @@ def filter_passthrough_args(script, passthrough_args):
     return filter_child_passthrough_args(passthrough_args, accepted)
 
 
+def recovery_astf_args(previous_item, passthrough_args):
+    options = {
+        "--server-ip-count",
+        "--astf-tcp-port",
+        "--preflight-success-consecutive",
+        "--preflight-probe-interval-sec",
+        "--preflight-timeout-sec",
+    }
+    values = {}
+    for arguments in (previous_item.get("args", []), passthrough_args):
+        index = 0
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument.startswith("--") and "=" in argument:
+                option, value = argument.split("=", 1)
+                if option in options:
+                    values[option] = value
+            elif argument in options and index + 1 < len(arguments):
+                values[argument] = arguments[index + 1]
+                index += 1
+            index += 1
+    return [value for option, item in values.items() for value in (option, item)]
+
+
 def write_launcher_metadata(out_dir, args, enabled_tests, passthrough_args, selection_mode):
     metadata = {
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
@@ -260,6 +284,9 @@ def main():
                 "--probe-interval-sec", str(args.inter_test_probe_interval_sec),
                 "--success-consecutive", str(args.inter_test_success_consecutive),
             ]
+            recovery_cmd.extend(
+                recovery_astf_args(previous_item, passthrough_args)
+            )
             if args.lan_source_port_range is not None:
                 recovery_cmd.extend([
                     "--lan-source-port-range",
@@ -291,6 +318,7 @@ def main():
             "--test-start-delay-sec",
             str(args.test_start_delay_sec),
         ]
+        cmd.extend(item.get("args", []))
         if "--repeat" in child_long_options(item["script"]):
             cmd.extend(["--repeat", str(args.repeat)])
         if (

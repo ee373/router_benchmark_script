@@ -545,7 +545,10 @@ def setup_namespaces(args, target, log_writer):
     lan_prefix = 64 if is_ipv6 and args.lan_prefix == DEFAULT_LAN_PREFIX else args.lan_prefix
     wan_prefix = 64 if is_ipv6 and args.wan_prefix == DEFAULT_WAN_PREFIX else args.wan_prefix
     run_cmd(["ip", "-n", args.lan_ns, "addr", "add", f"{target['lan_ip']}/{lan_prefix}", "dev", args.lan_iface])
-    run_cmd(["ip", "-n", args.wan_ns, "addr", "add", f"{target['wan_ip']}/{wan_prefix}", "dev", args.wan_iface])
+    wan_iface_ip = target.get("wan_iface_ip", target["wan_ip"])
+    run_cmd(["ip", "-n", args.wan_ns, "addr", "add", f"{wan_iface_ip}/{wan_prefix}", "dev", args.wan_iface])
+    if target["wan_ip"] != wan_iface_ip:
+        run_cmd(["ip", "-n", args.wan_ns, "addr", "add", f"{target['wan_ip']}/32", "dev", args.wan_iface])
     run_cmd(["ip", "-n", args.lan_ns, "link", "set", "dev", args.lan_iface, "up"])
     run_cmd(["ip", "-n", args.wan_ns, "link", "set", "dev", args.wan_iface, "up"])
 
@@ -568,7 +571,10 @@ def setup_namespaces(args, target, log_writer):
         ])
 
     log_writer.writerow([ts_iso(), "lan_address", f"{target['lan_ip']}/{lan_prefix} gw {target['lan_gw']}"])
-    log_writer.writerow([ts_iso(), "wan_address", f"{target['wan_ip']}/{wan_prefix} gw {target['router_wan_ip']}"])
+    wan_address_detail = f"{wan_iface_ip}/{wan_prefix}"
+    if target["wan_ip"] != wan_iface_ip:
+        wan_address_detail += f" service={target['wan_ip']}/32"
+    log_writer.writerow([ts_iso(), "wan_address", f"{wan_address_detail} gw {target['router_wan_ip']}"])
 
 
 def cleanup_namespaces(args, log_writer):
@@ -627,7 +633,7 @@ def make_namespace_arp_refresher(args, target, out_dir):
         {
             "namespace": args.wan_ns,
             "iface": args.wan_iface,
-            "src_ip": target["wan_ip"],
+            "src_ip": target.get("wan_iface_ip", target["wan_ip"]),
             "target_ip": target["router_wan_ip"],
         },
     ]
@@ -651,7 +657,7 @@ def make_namespace_neighbor_refresher(args, target, out_dir):
         {
             "namespace": args.wan_ns,
             "iface": args.wan_iface,
-            "src_ip": target["wan_ip"],
+            "src_ip": target.get("wan_iface_ip", target["wan_ip"]),
             "target_ip": target["router_wan_ip"],
         },
     ]

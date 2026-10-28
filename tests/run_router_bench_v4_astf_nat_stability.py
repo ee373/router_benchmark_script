@@ -101,6 +101,8 @@ try:
         require_root,
         resolve_astf_cores,
         resolve_ipv6_gateway_macs,
+        run_astf_roundtrip_preflight_consecutive,
+        run_astf_udp_roundtrip_preflight_consecutive,
         ts_compact,
         ts_iso,
         try_arp,
@@ -126,6 +128,8 @@ except Exception:
         require_root,
         resolve_astf_cores,
         resolve_ipv6_gateway_macs,
+        run_astf_roundtrip_preflight_consecutive,
+        run_astf_udp_roundtrip_preflight_consecutive,
         ts_compact,
         ts_iso,
         try_arp,
@@ -397,11 +401,14 @@ def add_udp_send_messages(program, bytes_total, msg_payload_bytes):
         program.send_msg(fill, size=remainder, fill=fill)
 
 
-def make_tcp_nat_stability_profile(target, args, bytes_per_session):
+def make_tcp_nat_stability_profile(target, args, bytes_per_session, server_ip=None):
     from trex.astf.api import ASTFGlobalInfo, ASTFProfile, ASTFProgram, ASTFTemplate, ASTFTCPClientTemplate, ASTFTCPServerTemplate
 
     is_ipv6 = target.get("ip_version") == "v6"
-    ip_gen = make_ipv6_ip_gen(target) if is_ipv6 else make_ip_gen(target)
+    ip_gen = (
+        make_ipv6_ip_gen(target) if is_ipv6
+        else make_ip_gen(target, server_ip=server_ip or target.get("astf_server_ipv4"))
+    )
     marker = payload_marker(args.payload_direction)
 
     prog_c = ASTFProgram()
@@ -461,11 +468,14 @@ def make_tcp_nat_stability_profile(target, args, bytes_per_session):
     )
 
 
-def make_udp_nat_stability_profile(target, args, bytes_per_session):
+def make_udp_nat_stability_profile(target, args, bytes_per_session, server_ip=None):
     from trex.astf.api import ASTFAssociationRule, ASTFGlobalInfo, ASTFProfile, ASTFProgram, ASTFTemplate, ASTFTCPClientTemplate, ASTFTCPServerTemplate
 
     is_ipv6 = target.get("ip_version") == "v6"
-    ip_gen = make_ipv6_ip_gen(target) if is_ipv6 else make_ip_gen(target)
+    ip_gen = (
+        make_ipv6_ip_gen(target) if is_ipv6
+        else make_ip_gen(target, server_ip=server_ip or target.get("astf_server_ipv4"))
+    )
     marker = payload_marker(args.payload_direction)
     msg_payload = int(args.udp_msg_payload_bytes)
     msg_count = udp_packet_count(bytes_per_session, msg_payload)
@@ -530,11 +540,11 @@ def make_udp_nat_stability_profile(target, args, bytes_per_session):
     )
 
 
-def make_nat_stability_profile(protocol, target, args, bytes_per_session):
+def make_nat_stability_profile(protocol, target, args, bytes_per_session, server_ip=None):
     if protocol == "tcp":
-        return make_tcp_nat_stability_profile(target, args, bytes_per_session)
+        return make_tcp_nat_stability_profile(target, args, bytes_per_session, server_ip=server_ip)
     if protocol == "udp":
-        return make_udp_nat_stability_profile(target, args, bytes_per_session)
+        return make_udp_nat_stability_profile(target, args, bytes_per_session, server_ip=server_ip)
     raise ValueError(f"unsupported protocol: {protocol}")
 
 
@@ -1127,28 +1137,75 @@ def run_protocol_cycles(client, raw_writer, cycle_writer, args, target, out_dir,
             if preflight is None:
                 preflight_started = time.time()
                 try:
-                    outcome = run_consecutive_preflight(
-                        lambda attempt: run_protocol_roundtrip_preflight(
+                    if protocol == "tcp" and target.get("astf_server_ipv4"):
+                        preflight = run_astf_roundtrip_preflight_consecutive(
                             client=client,
-                            raw_writer=raw_writer,
-                            args=args,
                             target=target,
-                            protocol=protocol,
-                            cycle_index=cycle_index,
-                            attempt=attempt,
-                        ),
-                        phase=f"{protocol}_protocol_start",
-                        csv_path=out_dir / "astf_preflight_recovery.csv",
-                        required_successes=args.preflight_success_consecutive,
-                        interval_sec=args.preflight_probe_interval_sec,
-                        timeout_sec=args.preflight_timeout_sec,
-                    )
-                    preflight = dict(outcome.value)
-                    preflight.update({
-                        "preflight_attempts": outcome.attempts,
-                        "preflight_consecutive_successes": outcome.consecutive_successes,
-                        "preflight_recovery_elapsed_sec": outcome.elapsed_sec,
-                    })
+                            raw_writer=raw_writer,
+                            test_name="mape_astf_nat_stability_tcp",
+                            recovery_csv=out_dir / "astf_preflight_recovery.csv",
+                            required_successes=args.preflight_success_consecutive,
+                            interval_sec=args.preflight_probe_interval_sec,
+                            timeout_sec=args.preflight_timeout_sec,
+                            tcp_port=args.astf_tcp_port,
+                            server_ip=target["astf_server_ipv4"],
+                        )
+                        expected_sessions = int(
+                            preflight.get("preflight_expected_sessions") or 0
+                        )
+                        client_to_server = min(
+                            float(preflight.get("preflight_client_tx_l7_bytes") or 0.0),
+                            float(preflight.get("preflight_server_rx_l7_bytes") or 0.0),
+                        )
+                        server_to_client = min(
+                            float(preflight.get("preflight_server_tx_l7_bytes") or 0.0),
+                            float(preflight.get("preflight_client_rx_l7_bytes") or 0.0),
+                        )
+                        preflight["preflight_payload_completion_rate"] = (
+                            clamp_rate(
+                                min(client_to_server, server_to_client)
+                                / expected_sessions
+                            )
+                            if expected_sessions > 0
+                            else 0.0
+                        )
+                    elif protocol == "udp" and target.get("astf_server_ipv4"):
+                        preflight = run_astf_udp_roundtrip_preflight_consecutive(
+                            client=client,
+                            target=target,
+                            raw_writer=raw_writer,
+                            test_name="mape_astf_nat_stability_udp",
+                            recovery_csv=out_dir / "astf_preflight_recovery.csv",
+                            required_successes=args.preflight_success_consecutive,
+                            interval_sec=args.preflight_probe_interval_sec,
+                            timeout_sec=args.preflight_timeout_sec,
+                            udp_port=args.astf_udp_port,
+                            server_ip=target["astf_server_ipv4"],
+                            udp_mtu=args.udp_mtu,
+                        )
+                    else:
+                        outcome = run_consecutive_preflight(
+                            lambda attempt: run_protocol_roundtrip_preflight(
+                                client=client,
+                                raw_writer=raw_writer,
+                                args=args,
+                                target=target,
+                                protocol=protocol,
+                                cycle_index=cycle_index,
+                                attempt=attempt,
+                            ),
+                            phase=f"{protocol}_protocol_start",
+                            csv_path=out_dir / "astf_preflight_recovery.csv",
+                            required_successes=args.preflight_success_consecutive,
+                            interval_sec=args.preflight_probe_interval_sec,
+                            timeout_sec=args.preflight_timeout_sec,
+                        )
+                        preflight = dict(outcome.value)
+                        preflight.update({
+                            "preflight_attempts": outcome.attempts,
+                            "preflight_consecutive_successes": outcome.consecutive_successes,
+                            "preflight_recovery_elapsed_sec": outcome.elapsed_sec,
+                        })
                 finally:
                     preflight_elapsed_total += time.time() - preflight_started
             profile = make_nat_stability_profile(
@@ -1406,6 +1463,8 @@ def main():
     print(f"ASTF DP cores       : {resolve_astf_cores(target)}")
     print(f"LAN/client          : port {target['lan_port']} / {target['lan_ip']} gw {target['lan_gw']}")
     print(f"WAN/server          : port {target['wan_port']} / {target['wan_ip']} gw {target['wan_gw']}")
+    if target.get("astf_server_ipv4"):
+        print(f"ASTF server IPv4    : {target['astf_server_ipv4']}")
     print(f"Router WAN IP       : {target['router_wan_ip']}")
     print(f"Protocols           : {','.join(args.protocols)}")
     print(f"ASTF TCP port       : {args.astf_tcp_port}")

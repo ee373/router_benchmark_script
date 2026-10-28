@@ -3,6 +3,7 @@
 """TRex ASTF DS-Lite short-session TCP CPS benchmark."""
 
 import argparse
+import ipaddress
 import json
 import sys
 from pathlib import Path
@@ -96,6 +97,57 @@ _ASTF_DEFAULTS = _load_defaults("astf")
 _DSLITE_ASTF_DEFAULTS = _load_defaults("dslite_astf")
 
 
+def build_server_ip_candidates(target, server_ip_count):
+    network = ipaddress.ip_network(target["server_network"], strict=True)
+    if network.version != 4:
+        raise ValueError("DS-Lite server_network must be IPv4")
+
+    server_ip = ipaddress.ip_address(target["server_ipv4"])
+    if server_ip.version != 4 or server_ip not in network:
+        raise ValueError(
+            f"DS-Lite server_ipv4 {server_ip} must be inside server_network {network}"
+        )
+
+    reserved_ips = {
+        network.network_address,
+        network.broadcast_address,
+        ipaddress.ip_address(target["wan_gateway_ip"]),
+    }
+    candidates = [
+        ipaddress.IPv4Address(value)
+        for value in range(
+            int(network.network_address) + 1,
+            int(network.broadcast_address),
+        )
+        if ipaddress.IPv4Address(value) not in reserved_ips
+    ]
+    if server_ip not in candidates:
+        raise ValueError(
+            f"DS-Lite server_ipv4 {server_ip} is reserved or is not a usable host"
+        )
+
+    count = int(server_ip_count)
+    if count <= 0:
+        raise ValueError("server_ip_count must be positive")
+    if count > len(candidates):
+        raise ValueError(
+            f"server_ip_count {count} exceeds usable server address count "
+            f"{len(candidates)} in {network}"
+        )
+
+    server_index = candidates.index(server_ip)
+    start_index = min(server_index, len(candidates) - count)
+    selected = candidates[start_index:start_index + count]
+    if any(
+        int(right) != int(left) + 1
+        for left, right in zip(selected, selected[1:])
+    ):
+        raise ValueError(
+            "Selected DS-Lite server candidates must form one contiguous IPv4 range"
+        )
+    return [str(address) for address in selected]
+
+
 def merge_dslite_target_with_overrides(base_target, args):
     target = dict(base_target)
     if args.interfaces:
@@ -106,7 +158,7 @@ def merge_dslite_target_with_overrides(base_target, args):
         ("wan_link_ip", "wan_link_ip"),
         ("wan_gateway_ip", "wan_gateway_ip"),
         ("wan_arp_target", "wan_arp_target"),
-        ("server_ip", "server_ip"),
+        ("server_ipv4", "server_ipv4"),
         ("nat_pool_cidr", "nat_pool_cidr"),
     ):
         value = getattr(args, argument_name)
@@ -120,7 +172,7 @@ def merge_dslite_target_with_overrides(base_target, args):
     return target
 
 
-def write_metadata(out_dir, target_name, target, trex_target, args):
+def write_metadata(out_dir, target_name, target, trex_target, args, server_ips):
     metadata = {
         "created_at": ts_iso(),
         "target_name": target_name,
@@ -140,6 +192,9 @@ def write_metadata(out_dir, target_name, target, trex_target, args):
         "transport": "tcp",
         "aftr_nat_pool": target["nat_pool_cidr"],
         "b4_session_limit": target["b4_session_limit"],
+        "server_ip_count": len(server_ips),
+        "astf_server_ip_range": [server_ips[0], server_ips[-1]],
+        "server_ip_distribution": "seq",
         "preflight": {
             "tcp_roundtrip": True,
             "client_to_server_payload": True,
@@ -246,6 +301,12 @@ def main():
     )
     parser.add_argument("--astf-tcp-port", type=int, default=ASTF_TCP_PORT)
     parser.add_argument(
+        "--server-ip-count",
+        type=int,
+        default=int(_DSLITE_ASTF_DEFAULTS.get("server_ip_count", 253)),
+        help="Number of sequential DS-Lite server IPv4 addresses to use.",
+    )
+    parser.add_argument(
         "--inter-test-sleep",
         type=float,
         default=_ASTF_DEFAULTS["inter_test_sleep_sec"],
@@ -258,7 +319,7 @@ def main():
     parser.add_argument("--wan-link-ip", default="")
     parser.add_argument("--wan-gateway-ip", default="")
     parser.add_argument("--wan-arp-target", default="")
-    parser.add_argument("--server-ip", default="")
+    parser.add_argument("--server-ip", "--server-ipv4", dest="server_ipv4", default="")
     parser.add_argument("--nat-pool-cidr", default="")
     parser.add_argument("--line-rate-gbps", type=float, default=None)
     parser.add_argument("--cores", type=int, default=None)
@@ -291,6 +352,8 @@ def main():
         raise SystemExit("ERROR: --representative-cps must be 1..65535")
     if args.astf_tcp_port <= 0 or args.astf_tcp_port > 65535:
         raise SystemExit("ERROR: --astf-tcp-port must be 1..65535")
+    if args.server_ip_count <= 0:
+        raise SystemExit("ERROR: --server-ip-count must be positive")
     if args.cps_teardown_timeout < 0:
         raise SystemExit("ERROR: --cps-teardown-timeout must be >= 0")
     if args.inter_test_sleep < 0:
@@ -307,6 +370,11 @@ def main():
         args,
     )
     validate_dslite_profile(args.target, target)
+    try:
+        server_ips = build_server_ip_candidates(target, args.server_ip_count)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
+    server_ip_range = (server_ips[0], server_ips[-1])
     trex_target = build_trex_target(target)
 
     out_dir = (
@@ -335,6 +403,11 @@ def main():
     )
     print(f"AFTR NAT pool       : {target['nat_pool_cidr']}")
     print(f"B4 session limit    : {target['b4_session_limit']}")
+    print(f"ASTF server IP count: {len(server_ips)}")
+    print(
+        f"ASTF server range   : {server_ip_range[0]}-{server_ip_range[1]} "
+        f"({len(server_ips)} IPv4 addresses)"
+    )
     print(f"ASTF TCP port       : {args.astf_tcp_port}")
     print(f"CPS steps           : {args.cps_steps}")
     print(f"Stable success min  : {args.stable_success_threshold:g}")
@@ -359,14 +432,19 @@ def main():
     print(f"TRex interface prep : {prepare_log}")
 
     install_trex_cfg(trex_target, details_dir, args.no_install_cfg)
-    write_metadata(details_dir, args.target, target, trex_target, args)
+    write_metadata(details_dir, args.target, target, trex_target, args, server_ips)
 
     summaries = []
     server = TrexAstfServer(cores=resolve_astf_cores(trex_target), out_dir=details_dir)
     try:
         server.start()
         summaries.extend(
-            run_astf_cps_tests(target=trex_target, out_dir=details_dir, args=args)
+            run_astf_cps_tests(
+                target=trex_target,
+                out_dir=details_dir,
+                args=args,
+                astf_server_ip_range=server_ip_range,
+            )
         )
     finally:
         server.stop()

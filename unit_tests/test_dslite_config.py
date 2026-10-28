@@ -29,6 +29,10 @@ from tests.run_router_bench_v4_tcp_scratch_max_sessions import (
     planned_session_count,
     session_endpoint_at,
 )
+from tests.run_router_bench_dslite_astf_sessions_cps import (
+    build_server_ip_candidates as build_astf_server_ip_candidates,
+)
+from tests.run_router_bench_recovery_check import run_astf_recovery
 from tests.run_router_bench_dslite_iperf3_latency import build_latency_targets
 
 
@@ -60,12 +64,24 @@ class DsliteConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not be inside nat_pool_cidr"):
             validate_dslite_profile("invalid", profile)
 
+    def test_server_ipv4_must_be_inside_declared_network_and_not_gateway(self):
+        profile = copy.deepcopy(DSLITE_TARGETS["i226_1g_dslite"])
+        profile["server_ipv4"] = "203.0.113.10"
+        with self.assertRaisesRegex(ValueError, "must be in server_network"):
+            validate_dslite_profile("invalid", profile)
+        profile["server_ipv4"] = profile["wan_gateway_ip"]
+        with self.assertRaisesRegex(ValueError, "must not be the WAN gateway"):
+            validate_dslite_profile("invalid", profile)
+
     def test_trex_aliases_use_link_and_arp_addresses(self):
         profile = DSLITE_TARGETS["i226_1g_dslite"]
         target = build_trex_target(profile)
         self.assertEqual(target["wan_ip"], "198.51.100.254")
         self.assertEqual(target["wan_gw"], "198.51.100.1")
         self.assertEqual(target["router_wan_ip"], "198.51.100.1")
+        self.assertEqual(target["server_ip"], "198.51.100.254")
+        self.assertEqual(profile["server_network"], "198.51.100.0/24")
+        self.assertEqual(profile["server_ipv4"], "198.51.100.254")
         self.assertNotIn("wan_ip", profile)
         self.assertNotIn("wan_gw", profile)
 
@@ -107,6 +123,20 @@ class DsliteConfigTest(unittest.TestCase):
         self.assertEqual(addresses[0], "198.51.100.254")
         self.assertEqual(addresses[-1], "198.51.100.187")
         self.assertNotIn("198.51.100.1", addresses)
+
+    def test_astf_server_candidates_match_profile_network(self):
+        profile = DSLITE_TARGETS["i226_1g_dslite"]
+        addresses = build_astf_server_ip_candidates(profile, 253)
+        self.assertEqual(len(addresses), 253)
+        self.assertEqual(addresses[0], "198.51.100.2")
+        self.assertEqual(addresses[-1], "198.51.100.254")
+        self.assertNotIn(profile["wan_gateway_ip"], addresses)
+        self.assertEqual(
+            build_astf_server_ip_candidates(profile, 4),
+            ["198.51.100.251", "198.51.100.252", "198.51.100.253", "198.51.100.254"],
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds usable"):
+            build_astf_server_ip_candidates(profile, 254)
 
     def test_max_session_plan_reuses_1000_ports_across_destinations(self):
         addresses = build_server_ip_list("198.51.100.254", 68, 24)
@@ -473,17 +503,31 @@ class DsliteConfigTest(unittest.TestCase):
         ), mock.patch.object(
             dslite_launcher.subprocess,
             "call",
-            side_effect=[1, 1, 0, 0, 0],
+            side_effect=[1, 1, 0, 0, 0, 0, 0],
         ) as call_mock:
             with self.assertRaises(SystemExit) as exit_context:
                 dslite_launcher.main()
 
         self.assertEqual(exit_context.exception.code, 1)
-        self.assertEqual(call_mock.call_count, 5)
+        self.assertEqual(call_mock.call_count, 7)
         commands = [call.args[0] for call in call_mock.call_args_list]
         self.assertTrue(any("run_router_bench_dslite_stl_throughput_pps.py" in command[1] for command in commands))
         self.assertTrue(any("run_router_bench_dslite_tcp_scratch_max_sessions.py" in command[1] for command in commands))
-        self.assertTrue(any("run_router_bench_dslite_astf_sessions_cps.py" in command[1] for command in commands))
+        astf_commands = [
+            command for command in commands
+            if "run_router_bench_dslite_astf_sessions_cps.py" in command[1]
+        ]
+        self.assertEqual(len(astf_commands), 2)
+        self.assertTrue(any("--server-ip-count 1" in " ".join(command) for command in astf_commands))
+        self.assertTrue(any("--server-ip-count 253" in " ".join(command) for command in astf_commands))
+        astf_transition_recovery = [
+            command for command in commands
+            if "run_router_bench_recovery_check.py" in command[1]
+            and "--next-test DS-Lite ASTF short-session TCP CPS (253 server IPs)"
+            in " ".join(command)
+        ]
+        self.assertEqual(len(astf_transition_recovery), 1)
+        self.assertIn("--server-ip-count 1", " ".join(astf_transition_recovery[0]))
 
     def test_dslite_astf_cps_help_without_trex_install(self):
         script = (
@@ -506,6 +550,99 @@ class DsliteConfigTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--cps-steps", proc.stdout)
         self.assertIn("--wan-link-ip", proc.stdout)
+        self.assertIn("--server-ip-count", proc.stdout)
+
+    def test_dslite_default_astf_cps_uses_one_and_253_server_ips(self):
+        launcher = Path(__file__).resolve().parents[1] / "test_dslite_speed.py"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(launcher),
+                "--target",
+                "i226_1g_dslite",
+                "--dry-run",
+            ],
+            cwd=str(launcher.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        commands = [
+            line for line in proc.stdout.splitlines()
+            if "run_router_bench_dslite_astf_sessions_cps.py" in line
+        ]
+        self.assertEqual(len(commands), 2, proc.stdout)
+        self.assertTrue(any("--server-ip-count 1" in line for line in commands))
+        self.assertTrue(any("--server-ip-count 253" in line for line in commands))
+
+    def test_dslite_inter_test_recovery_uses_shared_astf_preflight(self):
+        import types
+
+        from tests import run_router_bench_recovery_check as recovery
+
+        api = types.ModuleType("trex.astf.api")
+        client_instance = mock.Mock()
+        api.ASTFClient = mock.Mock(return_value=client_instance)
+        modules = {
+            "trex": types.ModuleType("trex"),
+            "trex.astf": types.ModuleType("trex.astf"),
+            "trex.astf.api": api,
+        }
+        args = type(
+            "RecoveryArgs",
+            (),
+            {
+                "server_ip_count": 4,
+                "preflight_success_consecutive": 3,
+                "preflight_probe_interval_sec": 2.0,
+                "preflight_timeout_sec": 300.0,
+                "astf_tcp_port": 80,
+                "previous_test": "DS-Lite CPS 4 IP",
+                "next_test": "DS-Lite CPS 253 IP",
+            },
+        )()
+        expected_result = {"preflight_ok": 1}
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(
+            sys.modules, modules
+        ), mock.patch.object(recovery, "add_trex_api_path") as add_api_path, mock.patch.object(
+            recovery, "prepare_trex_interfaces_from_profile"
+        ) as prepare_interfaces, mock.patch.object(
+            recovery, "install_trex_cfg"
+        ) as install_cfg, mock.patch.object(
+            recovery, "resolve_astf_cores", return_value=1
+        ), mock.patch.object(
+            recovery, "TrexAstfServer"
+        ) as trex_server_class, mock.patch.object(
+            recovery,
+            "run_astf_roundtrip_preflight_consecutive",
+            return_value=expected_result,
+        ) as astf_preflight:
+            server = trex_server_class.return_value
+            result = run_astf_recovery(
+                build_trex_target(DSLITE_TARGETS["i226_1g_dslite"]),
+                "dslite",
+                args,
+                Path(out_dir),
+            )
+
+        self.assertIs(result, expected_result)
+        add_api_path.assert_called_once_with()
+        prepare_interfaces.assert_called_once()
+        install_cfg.assert_called_once()
+        server.start.assert_called_once_with()
+        server.stop.assert_called_once_with()
+        client_instance.connect.assert_called_once_with()
+        client_instance.stop.assert_called_once_with()
+        client_instance.reset.assert_called_once_with()
+        client_instance.disconnect.assert_called_once_with()
+        self.assertEqual(
+            astf_preflight.call_args.kwargs["server_ip_range"],
+            ("198.51.100.251", "198.51.100.254"),
+        )
+        self.assertEqual(astf_preflight.call_args.kwargs["tcp_port"], 80)
+        self.assertEqual(astf_preflight.call_args.kwargs["required_successes"], 3)
 
     def test_dslite_max_session_help_without_trex_install(self):
         script = (

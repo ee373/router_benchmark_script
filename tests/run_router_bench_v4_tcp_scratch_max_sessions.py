@@ -92,7 +92,6 @@ try:
         merge_target_with_overrides,
         ns_cmd,
         prepare_kernel_interfaces_from_profile,
-        prepare_trex_interfaces_from_profile,
         require_command,
         require_profile_interfaces,
         require_root,
@@ -138,7 +137,6 @@ except Exception as exc:  # pragma: no cover
             merge_target_with_overrides,
             ns_cmd,
             prepare_kernel_interfaces_from_profile,
-            prepare_trex_interfaces_from_profile,
             require_command,
             require_profile_interfaces,
             require_root,
@@ -150,6 +148,14 @@ except Exception as exc:  # pragma: no cover
         )
     except Exception:
         raise SystemExit(f"ERROR: failed to import shared namespace helpers: {exc}")
+
+try:
+    from tests.lib.network import prepare_trex_interfaces_from_profile  # type: ignore
+except ImportError:
+    try:
+        from lib.network import prepare_trex_interfaces_from_profile  # type: ignore
+    except ImportError:
+        prepare_trex_interfaces_from_profile = None
 
 FRAME_HEADER = struct.Struct("!I")
 _TCP_DEFAULTS = _load_defaults("tcp_scratch")
@@ -291,7 +297,13 @@ def parse_non_negative_int(value):
     return i
 
 
-def build_server_ip_list(start_ip, count, prefix_len, reserved_ips=()):
+def build_server_ip_list(
+    start_ip,
+    count,
+    prefix_len,
+    reserved_ips=(),
+    required_ips=(),
+):
     """Return descending usable IPv4 host addresses beginning at start_ip."""
     count = int(count)
     if count <= 0:
@@ -301,13 +313,28 @@ def build_server_ip_list(start_ip, count, prefix_len, reserved_ips=()):
         raise ValueError("server IP must be IPv4")
     network = ip_network(f"{start}/{int(prefix_len)}", strict=False)
     reserved = {ip_address(value) for value in reserved_ips if value}
-    addresses = []
+    required = {ip_address(value) for value in required_ips if value}
+    if len(required) > count:
+        raise ValueError("required server IP count exceeds server IP count")
+    if any(
+        not isinstance(address, IPv4Address)
+        or address not in network
+        or address in reserved
+        or address in (network.network_address, network.broadcast_address)
+        for address in required
+    ):
+        raise ValueError("required server IPs must be usable addresses in the server network")
+    addresses = [str(address) for address in required]
     candidate_value = int(start)
     first_host = int(network.network_address) + 1
     last_host = int(network.broadcast_address) - 1
     while candidate_value >= first_host and len(addresses) < count:
         candidate = IPv4Address(candidate_value)
-        if int(candidate) <= last_host and candidate not in reserved:
+        if (
+            int(candidate) <= last_host
+            and candidate not in reserved
+            and candidate not in required
+        ):
             addresses.append(str(candidate))
         candidate_value -= 1
     if len(addresses) != count:
@@ -315,7 +342,7 @@ def build_server_ip_list(start_ip, count, prefix_len, reserved_ips=()):
             f"cannot allocate {count} descending server IPs from {start} "
             f"inside {network}; available={len(addresses)}"
         )
-    return addresses
+    return sorted(addresses, key=lambda value: int(ip_address(value)), reverse=True)
 
 
 def parse_server_ips(value):
@@ -329,24 +356,59 @@ def parse_server_ips(value):
     return addresses
 
 
-def planned_session_count(source_start_port, source_end_port, server_ip_count, max_sessions=0):
-    unique_ports = int(source_start_port) - int(source_end_port) + 1
-    if unique_ports <= 0:
+def parse_source_ports(value):
+    ports = [parse_port(item.strip()) for item in str(value or "").split(",") if item.strip()]
+    if not ports:
+        raise argparse.ArgumentTypeError("source port list must not be empty")
+    if len(set(ports)) != len(ports):
+        raise argparse.ArgumentTypeError("source port list must not contain duplicates")
+    return ports
+
+
+def resolve_source_ports(source_start_port, source_end_port, source_ports=None):
+    if source_ports:
+        ports = [parse_port(port) for port in source_ports]
+        if len(set(ports)) != len(ports):
+            raise ValueError("source port list must not contain duplicates")
+        return ports
+    if int(source_start_port) < int(source_end_port):
         raise ValueError("source_start_port must be greater than or equal to source_end_port")
+    return range(int(source_start_port), int(source_end_port) - 1, -1)
+
+
+def planned_session_count(
+    source_start_port,
+    source_end_port,
+    server_ip_count,
+    max_sessions=0,
+    source_ports=None,
+):
+    unique_ports = len(
+        resolve_source_ports(source_start_port, source_end_port, source_ports)
+    )
     capacity = unique_ports * int(server_ip_count)
     if int(max_sessions) > 0:
         return min(capacity, int(max_sessions))
     return capacity
 
 
-def session_endpoint_at(index, source_start_port, source_end_port, server_ips):
-    unique_ports = int(source_start_port) - int(source_end_port) + 1
-    if unique_ports <= 0:
-        raise ValueError("invalid source port range")
+def session_endpoint_at(
+    index,
+    source_start_port,
+    source_end_port,
+    server_ips,
+    source_ports=None,
+):
+    ports = (
+        source_ports
+        if source_ports is not None
+        else resolve_source_ports(source_start_port, source_end_port)
+    )
+    unique_ports = len(ports)
     server_index, source_index = divmod(int(index), unique_ports)
     if server_index >= len(server_ips):
         raise IndexError(index)
-    return int(source_start_port) - source_index, server_ips[server_index]
+    return ports[source_index], server_ips[server_index]
 
 
 def configure_or_verify_server_ips(args, target, server_ips, log_writer):
@@ -966,11 +1028,17 @@ def run_client(args):
     summary_path = out_dir / "tcp_scratch_max_sessions_summary.json"
 
     server_ips = parse_server_ips(args.server_ips) if args.server_ips else [args.server_ip]
+    source_ports = resolve_source_ports(
+        args.source_start_port,
+        args.source_end_port,
+        getattr(args, "source_ports", None),
+    )
     planned_sessions = planned_session_count(
         args.source_start_port,
         args.source_end_port,
         len(server_ips),
         args.max_sessions,
+        source_ports=source_ports,
     )
     raise_limit = raise_nofile_limit(planned_sessions + DEFAULT_RLIMIT_NOFILE_MARGIN)
 
@@ -1289,6 +1357,7 @@ def run_client(args):
                         args.source_start_port,
                         args.source_end_port,
                         server_ips,
+                        source_ports=source_ports,
                     )
                     create_connection(source_port, server_ip)
                     next_session_index += 1
@@ -1323,6 +1392,7 @@ def run_client(args):
                             args.source_start_port,
                             args.source_end_port,
                             server_ips,
+                            source_ports=source_ports,
                         )
                     else:
                         next_source_port, current_server_ip = "", ""
@@ -1467,15 +1537,49 @@ def run_orchestrator(args, targets=None):
                 target[target_key] = value
     else:
         target = merge_target_with_overrides(dict(targets[args.target]), args)
-    server_ip = args.server_ip or target["wan_ip"]
+    server_ip = args.server_ip or target.get("scratch_server_ip") or target["wan_ip"]
     args.server_ip = server_ip
-    server_ips = build_server_ip_list(
-        server_ip,
-        args.server_ip_count,
-        args.wan_prefix,
-        reserved_ips=(target.get("router_wan_ip"),),
+    server_prefix = args.wan_prefix
+    reserved_server_ips = [target.get("router_wan_ip")]
+    if getattr(args, "benchmark_mode", "ipv4") == "mape":
+        server_network = ip_network(target["server_network"], strict=True)
+        if server_network.version != 4:
+            raise SystemExit("ERROR: MAP-E server_network must be IPv4")
+        server_prefix = server_network.prefixlen
+        reserved_server_ips.append(str(server_network.network_address + 1))
+        if ip_address(server_ip) not in server_network:
+            raise SystemExit(
+                f"ERROR: MAP-E server IP start {server_ip} is outside "
+                f"server_network {server_network}"
+            )
+    try:
+        server_ips = build_server_ip_list(
+            server_ip,
+            args.server_ip_count,
+            server_prefix,
+            reserved_ips=reserved_server_ips,
+            required_ips=(
+                (target["server_ipv4"],)
+                if getattr(args, "benchmark_mode", "ipv4") == "mape"
+                else ()
+            ),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: invalid server IPv4 allocation: {exc}") from exc
+    if (
+        getattr(args, "benchmark_mode", "ipv4") == "mape"
+        and target["server_ipv4"] not in server_ips
+    ):
+        raise SystemExit(
+            f"ERROR: MAP-E server IP list must include the profile server_ipv4 "
+            f"{target['server_ipv4']}"
+        )
+    source_ports = resolve_source_ports(
+        args.source_start_port,
+        args.source_end_port,
+        getattr(args, "source_ports", None),
     )
-    unique_source_ports = args.source_start_port - args.source_end_port + 1
+    unique_source_ports = len(source_ports)
     session_capacity = unique_source_ports * len(server_ips)
     if args.max_sessions > session_capacity:
         raise SystemExit(
@@ -1487,6 +1591,7 @@ def run_orchestrator(args, targets=None):
         args.source_end_port,
         len(server_ips),
         args.max_sessions,
+        source_ports=source_ports,
     )
     if getattr(args, "benchmark_mode", "ipv4") == "dslite":
         b4_session_limit = int(target.get("b4_session_limit") or 0)
@@ -1563,6 +1668,19 @@ def run_orchestrator(args, targets=None):
                     "mapping_key": "B4 IPv6, inner IPv4 source, source port, protocol",
                     "destination_in_mapping_key": False,
                 }
+            if getattr(args, "benchmark_mode", "ipv4") == "mape":
+                metadata["mape_port_multiplexing"] = {
+                    "shared_ipv4": target["shared_ipv4"],
+                    "psid": int(target["psid"]),
+                    "psid_offset": int(target["psid_offset"]),
+                    "psid_length": int(target["psid_length"]),
+                    "server_network": str(server_network),
+                    "destination_ipv4_count": len(server_ips),
+                    "unique_psid_source_ports": unique_source_ports,
+                    "psid_source_ports": list(source_ports),
+                    "planned_session_capacity": session_capacity,
+                    "destination_addresses_may_reuse_source_ports": True,
+                }
             write_json(details_dir / "tcp_scratch_max_sessions_metadata.json", metadata)
 
             print("============================================================")
@@ -1578,7 +1696,13 @@ def run_orchestrator(args, targets=None):
                 f"WAN servers     : {server_ips[0]}..{server_ips[-1]} "
                 f"({len(server_ips)} addresses), TCP {args.server_port}"
             )
-            print(f"Source ports    : {args.source_start_port} down to {args.source_end_port}")
+            if getattr(args, "benchmark_mode", "ipv4") == "mape":
+                print(
+                    f"Source ports    : {unique_source_ports} MAP-E PSID ports "
+                    f"({min(source_ports)}..{max(source_ports)})"
+                )
+            else:
+                print(f"Source ports    : {args.source_start_port} down to {args.source_end_port}")
             print(f"Planned sessions: {planned_sessions}")
             print(f"Repeat          : {args.repeat}")
             print(f"Session rate    : {args.session_cps} CPS")
@@ -1631,7 +1755,7 @@ def run_orchestrator(args, targets=None):
                 "--ready-file", str(ready_path),
                 "--client-status-file", str(client_status_path),
             ])
-            client_cmd = ns_cmd(args.lan_ns, [
+            client_args = [
                 sys.executable,
                 str(Path(__file__).resolve()),
                 "--internal-role", "client",
@@ -1654,7 +1778,13 @@ def run_orchestrator(args, targets=None):
                 "--max-create-batch", str(args.max_create_batch),
                 "--progress-interval-sec", str(args.progress_interval_sec),
                 "--client-status-file", str(client_status_path),
-            ])
+            ]
+            if getattr(args, "benchmark_mode", "ipv4") == "mape":
+                client_args.extend([
+                    "--source-ports",
+                    ",".join(str(port) for port in source_ports),
+                ])
+            client_cmd = ns_cmd(args.lan_ns, client_args)
 
             print("[RUN] WAN TCP server")
             print(" ".join(server_cmd))
@@ -1674,11 +1804,18 @@ def run_orchestrator(args, targets=None):
                     "--server-port", str(args.server_port),
                     "--connect-timeout-sec", str(args.connect_timeout_sec),
                 ])
-                if len(server_ips) > 1 and args.source_end_port > 1:
+                if len(server_ips) > 1 and (
+                    getattr(args, "benchmark_mode", "ipv4") == "mape"
+                    or args.source_end_port > 1
+                ):
                     preflight_source_port = (
-                        args.source_end_port
-                        if args.lan_source_port_range is not None
-                        else args.source_end_port - 1
+                        source_ports[0]
+                        if getattr(args, "benchmark_mode", "ipv4") == "mape"
+                        else (
+                            args.source_end_port
+                            if args.lan_source_port_range is not None
+                            else args.source_end_port - 1
+                        )
                     )
                     preflight_cmd_base.extend(
                         ["--preflight-source-port", str(preflight_source_port)]
@@ -1839,7 +1976,13 @@ def run_orchestrator(args, targets=None):
             cleanup_namespaces(args, ns_log)
 
 
-def build_parser(targets=None, default_target=None, parser_defaults=None, description=None):
+def build_parser(
+    targets=None,
+    default_target=None,
+    parser_defaults=None,
+    description=None,
+    source_ports_mode=False,
+):
     targets = targets or TARGETS
     parser_defaults = dict(parser_defaults or {})
     parser = argparse.ArgumentParser(
@@ -1853,7 +1996,15 @@ def build_parser(targets=None, default_target=None, parser_defaults=None, descri
         choices=targets.keys(),
         default=default_target or _TCP_DEFAULTS["target"],
     )
-    parser.add_argument("--out-dir", default="", help="Result directory. Default: /var/trex/trex_tcp_scratch_max_sessions_<target>_<timestamp>/. ")
+    parser.add_argument(
+        "--out-dir",
+        default="",
+        help=(
+            "Result directory. Default: /var/trex/"
+            f"{parser_defaults.get('out_prefix', 'trex_tcp_scratch_max_sessions')}"
+            "_<target>_<timestamp>/."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--repeat",
@@ -1866,11 +2017,13 @@ def build_parser(targets=None, default_target=None, parser_defaults=None, descri
         "--source-start-port",
         type=parse_port,
         default=int(parser_defaults.get("source_start_port", DEFAULT_SOURCE_START_PORT)),
+        help=argparse.SUPPRESS if source_ports_mode else None,
     )
     parser.add_argument(
         "--source-end-port",
         type=parse_port,
         default=int(parser_defaults.get("source_end_port", DEFAULT_SOURCE_END_PORT)),
+        help=argparse.SUPPRESS if source_ports_mode else None,
     )
     parser.add_argument(
         "--max-sessions",
@@ -1903,7 +2056,8 @@ def build_parser(targets=None, default_target=None, parser_defaults=None, descri
     parser.add_argument("--server-ready-timeout-sec", type=parse_positive_float, default=_TCP_DEFAULTS["server_ready_timeout_sec"])
     parser.add_argument("--max-create-batch", type=parse_positive_int, default=DEFAULT_MAX_CREATE_BATCH)
     add_consecutive_preflight_arguments(parser)
-    add_lan_source_port_range_argument(parser)
+    if not source_ports_mode:
+        add_lan_source_port_range_argument(parser)
 
     parser.add_argument("--lan-ns", default=DEFAULT_LAN_NS)
     parser.add_argument("--wan-ns", default=DEFAULT_WAN_NS)
@@ -1938,10 +2092,18 @@ def build_parser(targets=None, default_target=None, parser_defaults=None, descri
         default="",
     )
     parser.add_argument("--client-ip", default="", help="LAN client bind IP. Default: target lan_ip.")
-    parser.add_argument("--server-ip", default="", help="WAN server bind/connect IP. Default: target wan_ip.")
+    parser.add_argument(
+        "--server-ip",
+        default=str(parser_defaults.get("server_ip", "")),
+        help=(
+            "WAN server start IP. Default: "
+            f"{parser_defaults.get('server_ip') or 'target wan_ip'}."
+        ),
+    )
 
     parser.add_argument("--bind-ip", default="", help=argparse.SUPPRESS)
     parser.add_argument("--server-ips", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--source-ports", type=parse_source_ports, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--preflight-source-port", type=parse_non_negative_int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--expected-sessions", type=parse_non_negative_int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--ready-file", default="", help=argparse.SUPPRESS)
@@ -1959,6 +2121,7 @@ def main(
     test_name="tcp_scratch_max_sessions",
     out_prefix="trex_tcp_scratch_max_sessions",
     description=None,
+    source_ports=None,
 ):
     targets = targets or TARGETS
     parser = build_parser(
@@ -1966,16 +2129,39 @@ def main(
         default_target=default_target,
         parser_defaults=parser_defaults,
         description=description,
+        source_ports_mode=source_ports is not None,
     )
     args = parser.parse_args()
+    if not hasattr(args, "lan_source_port_range"):
+        args.lan_source_port_range = None
     args.benchmark_mode = benchmark_mode
     args.benchmark_title = benchmark_title
     args.test_name = test_name
     args.out_prefix = out_prefix
     validate_consecutive_preflight_arguments(args)
+    if source_ports is not None:
+        if args.lan_source_port_range is not None:
+            raise SystemExit(
+                "ERROR: --lan-source-port-range cannot be used with the MAP-E PSID port set"
+            )
+        resolved_source_ports = (
+            source_ports(args.target) if callable(source_ports) else source_ports
+        )
+        args.source_ports = list(resolved_source_ports)
+        if (
+            args.source_start_port != max(args.source_ports)
+            or args.source_end_port != min(args.source_ports)
+        ):
+            raise SystemExit(
+                "ERROR: --source-start-port and --source-end-port cannot override "
+                "the MAP-E PSID source-port set"
+            )
     if args.lan_source_port_range is not None:
         args.source_end_port, args.source_start_port = args.lan_source_port_range
-    if args.source_start_port < args.source_end_port:
+    if args.source_ports:
+        args.source_start_port = max(args.source_ports)
+        args.source_end_port = min(args.source_ports)
+    elif args.source_start_port < args.source_end_port:
         raise SystemExit("ERROR: --source-start-port must be greater than or equal to --source-end-port")
     if args.internal_role == "server":
         if not args.bind_ip:

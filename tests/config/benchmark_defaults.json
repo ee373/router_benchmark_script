@@ -47,20 +47,33 @@
     "test_plan": [
       {"key": "dslite_stl_throughput", "run_arg": "run_stl_throughput", "name": "DS-Lite IPv4 STL throughput/PPS", "script": "run_router_bench_dslite_stl_throughput_pps.py", "out_dir_name": "01_dslite_stl_throughput_pps", "default": true},
       {"key": "dslite_tcp_scratch_max_sessions", "run_arg": "run_tcp_scratch_max_sessions", "name": "DS-Lite TCP scratch maximum sessions", "script": "run_router_bench_dslite_tcp_scratch_max_sessions.py", "out_dir_name": "02_dslite_tcp_scratch_max_sessions", "default": true},
-      {"key": "dslite_astf_sessions_cps", "run_arg": "run_astf_sessions_cps", "name": "DS-Lite ASTF short-session TCP CPS", "script": "run_router_bench_dslite_astf_sessions_cps.py", "out_dir_name": "03_dslite_astf_sessions_cps", "default": true},
-      {"key": "dslite_astf_nat", "run_arg": "run_astf_natstability", "name": "DS-Lite ASTF NAT stability soak", "script": "run_router_bench_dslite_astf_nat_stability.py", "out_dir_name": "04_dslite_astf_nat_stability", "default": false},
-      {"key": "dslite_l4_latency", "run_arg": "run_l4_latency", "name": "DS-Lite TCP/UDP request-response latency 0/10/20/30/40/50/60/70/80/90/95/99%", "script": "run_router_bench_dslite_iperf3_latency.py", "out_dir_name": "05_dslite_iperf3_l4rr_latency", "default": true},
+      {"key": "dslite_astf_sessions_cps_1ip", "run_arg": "run_astf_sessions_cps", "name": "DS-Lite ASTF short-session TCP CPS (1 server IP)", "script": "run_router_bench_dslite_astf_sessions_cps.py", "out_dir_name": "03_dslite_astf_sessions_cps_1ip", "default": true, "run_all": true, "args": ["--server-ip-count", "1"]},
+      {"key": "dslite_astf_sessions_cps_253ip", "run_arg": "run_astf_sessions_cps", "name": "DS-Lite ASTF short-session TCP CPS (253 server IPs)", "script": "run_router_bench_dslite_astf_sessions_cps.py", "out_dir_name": "04_dslite_astf_sessions_cps_253ip", "default": true, "run_all": true, "args": ["--server-ip-count", "253"]},
+      {"key": "dslite_astf_nat", "run_arg": "run_astf_natstability", "name": "DS-Lite ASTF NAT stability soak", "script": "run_router_bench_dslite_astf_nat_stability.py", "out_dir_name": "05_dslite_astf_nat_stability", "default": false},
+      {"key": "dslite_l4_latency", "run_arg": "run_l4_latency", "name": "DS-Lite TCP/UDP request-response latency 0/10/20/30/40/50/60/70/80/90/95/99%", "script": "run_router_bench_dslite_iperf3_latency.py", "out_dir_name": "06_dslite_iperf3_l4rr_latency", "default": true},
       {"key": "dslite_tcp_source_port_scan", "run_arg": "run_dslite_source_port_scan", "name": "DS-Lite TCP source-port scan (special)", "script": "run_router_bench_dslite_tcp_source_port_scan.py", "out_dir_name": "special_dslite_tcp_source_port_scan", "default": false, "run_all": false}
     ]
   },
   "mape_launcher": {
     "target": "i226_1g_mape",
     "test_plan": [
-      {"key": "mape_stl_throughput", "run_arg": "run_stl_throughput", "name": "MAP-E IPv4 STL throughput/PPS", "script": "run_router_bench_mape_stl_throughput_pps.py", "out_dir_name": "01_mape_stl_throughput_pps", "default": true}
+      {"key": "mape_stl_throughput", "run_arg": "run_stl_throughput", "name": "MAP-E IPv4 STL throughput/PPS", "script": "run_router_bench_mape_stl_throughput_pps.py", "out_dir_name": "01_mape_stl_throughput_pps", "default": true},
+      {"key": "mape_tcp_scratch_max_sessions", "run_arg": "run_tcp_scratch_max_sessions", "name": "MAP-E TCP scratch maximum sessions", "script": "run_router_bench_mape_tcp_scratch_max_sessions.py", "out_dir_name": "02_mape_tcp_scratch_max_sessions", "default": false, "run_all": true},
+      {"key": "mape_astf_sessions_cps_4ip", "run_arg": "run_astf_sessions_cps", "name": "MAP-E ASTF short-session TCP CPS (4 server IPs)", "script": "run_router_bench_mape_astf_sessions_cps.py", "out_dir_name": "03_mape_astf_sessions_cps_4ip", "default": true, "run_all": true, "args": ["--server-ip-count", "4"]},
+      {"key": "mape_astf_sessions_cps_253ip", "run_arg": "run_astf_sessions_cps", "name": "MAP-E ASTF short-session TCP CPS (253 server IPs)", "script": "run_router_bench_mape_astf_sessions_cps.py", "out_dir_name": "04_mape_astf_sessions_cps_253ip", "default": true, "run_all": true, "args": ["--server-ip-count", "253"]},
+      {"key": "mape_astf_nat_stability", "run_arg": "run_astf_natstability", "name": "MAP-E ASTF NAT stability soak", "script": "run_router_bench_mape_astf_nat_stability.py", "out_dir_name": "05_mape_astf_nat_stability", "default": false, "run_all": true},
+      {"key": "mape_l4_latency", "run_arg": "run_l4_latency", "name": "MAP-E TCP/UDP request-response latency 0/10/20/30/40/50/60/70/80/90/95/99%", "script": "run_router_bench_mape_iperf3_latency.py", "out_dir_name": "06_mape_iperf3_l4rr_latency", "default": true, "run_all": true}
     ]
   },
   "dslite_astf": {
-    "target": "i226_1g_dslite"
+    "target": "i226_1g_dslite",
+    "server_ip_count": 253
+  },
+  "mape_nat_stability": {
+    "target": "i226_1g_mape"
+  },
+  "mape_l4_latency": {
+    "target": "i226_1g_mape"
   },
   "dslite_nat_stability": {
     "target": "i226_1g_dslite",
@@ -75,6 +88,20 @@
     "source_end_port": 64536,
     "server_ip_count": 68,
     "max_sessions": 68000
+  },
+  "mape_tcp_scratch": {
+    "target": "i226_1g_mape",
+    "out_prefix": "trex_mape_tcp_scratch_max_sessions",
+    "source_start_port": 61503,
+    "source_end_port": 4144,
+    "server_ip": "203.0.113.254",
+    "server_ip_count": 253,
+    "max_sessions": 0
+  },
+  "mape_astf": {
+    "target": "i226_1g_mape",
+    "out_prefix": "trex_mape_astf_sessions_cps",
+    "server_ip_count": 4
   },
   "dslite_source_port_scan": {
     "target": "i226_1g_dslite",

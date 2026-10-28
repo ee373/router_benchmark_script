@@ -105,6 +105,7 @@ class LauncherHelperTests(unittest.TestCase):
                     "name": "Sample test",
                     "script": script,
                     "out_dir_name": "01_sample",
+                    "args": ["--server-ip-count", "4"],
                 }],
                 script_dir,
             )
@@ -121,6 +122,7 @@ class LauncherHelperTests(unittest.TestCase):
             self.assertEqual(payload, metadata)
             self.assertEqual(entries[0]["script"], "tests/child.py")
             self.assertEqual(entries[0]["out_dir"], str((out_dir / "01_sample").resolve()))
+            self.assertEqual(entries[0]["args"], ["--server-ip-count", "4"])
 
     def test_launcher_metadata_retains_mode_specific_keys_and_path_shape(self):
         enabled_tests = [{

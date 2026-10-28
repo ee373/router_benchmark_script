@@ -26,8 +26,10 @@ STL throughput/PPSは、各測定点で事前確認を1回実行してから測�
 
 MAP-E measurements use `test_mape_speed.py` and
 `tests/config/target_mape_profiles.json`. They do not use
-`test_basic_speed.py`. The initial implementation contains throughput and
-small-packet forwarding tests only.
+`test_basic_speed.py`. The launcher includes throughput and small-packet
+forwarding tests plus a TCP scratch maximum-session benchmark.
+The maximum-session test is selected explicitly with
+`--run-tcp-scratch-max-sessions` or included by `--run-all`.
 
 ```bash
 sudo python3 test_mape_speed.py \

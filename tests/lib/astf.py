@@ -660,11 +660,28 @@ def calc_hold_metrics_from_samples(samples, ramp_sec, duration_sec):
     }
 
 
-def make_ip_gen(target):
+def make_ip_gen(target, server_ip=None, server_ip_range=None):
     from trex.astf.api import ASTFIPGen, ASTFIPGenDist, ASTFIPGenGlobal
 
+    if server_ip is not None and server_ip_range is not None:
+        raise ValueError("Specify either server_ip or server_ip_range, not both")
+    if server_ip_range is not None:
+        if len(server_ip_range) != 2:
+            raise ValueError("server_ip_range must contain start and end IPv4 addresses")
+        server_start = ipaddress.ip_address(server_ip_range[0])
+        server_end = ipaddress.ip_address(server_ip_range[1])
+        if (
+            server_start.version != 4
+            or server_end.version != 4
+            or server_start > server_end
+        ):
+            raise ValueError("server_ip_range must be an ordered IPv4 range")
+        server_range = [str(server_start), str(server_end)]
+    else:
+        server_ip = server_ip or target["wan_ip"]
+        server_range = [server_ip, server_ip]
     ip_gen_c = ASTFIPGenDist(ip_range=[target["lan_ip"], target["lan_ip"]], distribution="seq")
-    ip_gen_s = ASTFIPGenDist(ip_range=[target["wan_ip"], target["wan_ip"]], distribution="seq")
+    ip_gen_s = ASTFIPGenDist(ip_range=server_range, distribution="seq")
     return ASTFIPGen(
         glob=ASTFIPGenGlobal(ip_offset="0.0.0.0"),
         dist_client=ip_gen_c,
@@ -751,10 +768,20 @@ def make_long_session_profile(target, cps, max_sessions, keepalive_seconds, tcp_
     return ASTFProfile(default_ip_gen=ip_gen, templates=template, default_c_glob_info=info, default_s_glob_info=info)
 
 
-def make_short_session_profile(target, cps, tcp_port):
+def make_short_session_profile(
+    target,
+    cps,
+    tcp_port,
+    server_ip=None,
+    server_ip_range=None,
+):
     from trex.astf.api import ASTFGlobalInfo, ASTFProfile, ASTFProgram, ASTFTemplate, ASTFTCPClientTemplate, ASTFTCPServerTemplate
 
-    ip_gen = make_ip_gen(target)
+    ip_gen = make_ip_gen(
+        target,
+        server_ip=server_ip,
+        server_ip_range=server_ip_range,
+    )
 
     prog_c = ASTFProgram()
     prog_c.send(b"C")
@@ -784,6 +811,8 @@ def run_astf_roundtrip_preflight(
     client, target, raw_writer, test_name, tcp_port=ASTF_TCP_PORT,
     cps=DEFAULT_ASTF_PREFLIGHT_CPS, duration_sec=DEFAULT_ASTF_PREFLIGHT_DURATION_SEC,
     minimum_success_rate=DEFAULT_ASTF_PREFLIGHT_MIN_SUCCESS_RATE,
+    server_ip=None,
+    server_ip_range=None,
 ):
     """Run a small TCP request/reply profile before a measured ASTF step.
 
@@ -795,7 +824,13 @@ def run_astf_roundtrip_preflight(
     cps = max(1.0, float(cps))
     duration_sec = max(1.0, float(duration_sec))
     expected_sessions = max(1, int(cps * duration_sec))
-    profile = make_short_session_profile(target=target, cps=cps, tcp_port=tcp_port)
+    profile = make_short_session_profile(
+        target=target,
+        cps=cps,
+        tcp_port=tcp_port,
+        server_ip=server_ip,
+        server_ip_range=server_ip_range,
+    )
     stats = run_astf_profile(
         client=client,
         profile=profile,
@@ -856,6 +891,8 @@ def run_astf_roundtrip_preflight_consecutive(
     cps=DEFAULT_ASTF_PREFLIGHT_CPS,
     duration_sec=DEFAULT_ASTF_PREFLIGHT_DURATION_SEC,
     minimum_success_rate=DEFAULT_ASTF_PREFLIGHT_MIN_SUCCESS_RATE,
+    server_ip=None,
+    server_ip_range=None,
 ):
     """Require consecutive successful ASTF request/reply canaries."""
 
@@ -869,6 +906,8 @@ def run_astf_roundtrip_preflight_consecutive(
             cps=cps,
             duration_sec=duration_sec,
             minimum_success_rate=minimum_success_rate,
+            server_ip=server_ip,
+            server_ip_range=server_ip_range,
         )
 
     outcome = run_consecutive_preflight(
@@ -886,6 +925,246 @@ def run_astf_roundtrip_preflight_consecutive(
         "preflight_recovery_elapsed_sec": outcome.elapsed_sec,
     })
     return result
+
+
+def make_udp_roundtrip_profile(
+    target,
+    udp_port,
+    cps,
+    server_ip=None,
+    server_ip_range=None,
+    udp_mtu=1400,
+):
+    """Build a one-byte UDP request/reply ASTF profile."""
+    from trex.astf.api import (
+        ASTFAssociationRule,
+        ASTFGlobalInfo,
+        ASTFProfile,
+        ASTFProgram,
+        ASTFTemplate,
+        ASTFTCPClientTemplate,
+        ASTFTCPServerTemplate,
+    )
+
+    ip_gen = make_ip_gen(
+        target,
+        server_ip=server_ip,
+        server_ip_range=server_ip_range,
+    )
+    client_program = ASTFProgram(stream=False, udp_mtu=int(udp_mtu))
+    client_program.send_msg(b"C")
+    client_program.recv_msg(1)
+    client_program.close_msg()
+
+    server_program = ASTFProgram(stream=False, udp_mtu=int(udp_mtu))
+    server_program.recv_msg(1)
+    server_program.send_msg(b"S")
+    server_program.close_msg()
+
+    client_template = ASTFTCPClientTemplate(
+        program=client_program,
+        ip_gen=ip_gen,
+        port=int(udp_port),
+        cps=float(cps),
+    )
+    server_template = ASTFTCPServerTemplate(
+        program=server_program,
+        assoc=ASTFAssociationRule(port=int(udp_port)),
+    )
+    template = ASTFTemplate(
+        client_template=client_template,
+        server_template=server_template,
+        tg_name="roundtrip_udp",
+    )
+    return ASTFProfile(
+        default_ip_gen=ip_gen,
+        templates=template,
+        default_c_glob_info=ASTFGlobalInfo(),
+        default_s_glob_info=ASTFGlobalInfo(),
+    )
+
+
+def run_astf_udp_roundtrip_preflight(
+    client,
+    target,
+    raw_writer,
+    test_name,
+    udp_port,
+    cps=DEFAULT_ASTF_PREFLIGHT_CPS,
+    duration_sec=DEFAULT_ASTF_PREFLIGHT_DURATION_SEC,
+    minimum_success_rate=DEFAULT_ASTF_PREFLIGHT_MIN_SUCCESS_RATE,
+    server_ip=None,
+    server_ip_range=None,
+    udp_mtu=1400,
+):
+    """Run a small bidirectional UDP ASTF request/reply preflight."""
+    cps = max(1.0, float(cps))
+    duration_sec = max(1.0, float(duration_sec))
+    expected_sessions = max(1, int(cps * duration_sec))
+    profile = make_udp_roundtrip_profile(
+        target=target,
+        udp_port=udp_port,
+        cps=cps,
+        server_ip=server_ip,
+        server_ip_range=server_ip_range,
+        udp_mtu=udp_mtu,
+    )
+    stats = run_astf_profile(
+        client=client,
+        profile=profile,
+        phase="astf_udp_roundtrip_preflight",
+        test_name=f"{test_name}_preflight",
+        duration=duration_sec,
+        raw_writer=raw_writer,
+        wait_timeout_extra=15,
+        nc=False,
+        t_duration=1.0,
+    )
+
+    traffic_client = traffic_side(stats, "client")
+    traffic_server = traffic_side(stats, "server")
+    client_tx_bytes = first_number(
+        traffic_client, ["udps_sndbyte", "udps_sndbytes", "udp_sndbyte", "sndbyte"]
+    )
+    server_rx_bytes = first_number(
+        traffic_server, ["udps_rcvbyte", "udps_rcvbytes", "udp_rcvbyte", "rcvbyte"]
+    )
+    server_tx_bytes = first_number(
+        traffic_server, ["udps_sndbyte", "udps_sndbytes", "udp_sndbyte", "sndbyte"]
+    )
+    client_rx_bytes = first_number(
+        traffic_client, ["udps_rcvbyte", "udps_rcvbytes", "udp_rcvbyte", "rcvbyte"]
+    )
+
+    client_tx_packets = first_number(
+        traffic_client, ["udps_sndpkt", "udp_sndpkt", "sndpkt"]
+    )
+    server_rx_packets = first_number(
+        traffic_server, ["udps_rcvpkt", "udp_rcvpkt", "rcvpkt"]
+    )
+    server_tx_packets = first_number(
+        traffic_server, ["udps_sndpkt", "udp_sndpkt", "sndpkt"]
+    )
+    client_rx_packets = first_number(
+        traffic_client, ["udps_rcvpkt", "udp_rcvpkt", "rcvpkt"]
+    )
+    established_sessions = min(
+        client_tx_packets,
+        server_rx_packets,
+        server_tx_packets,
+        client_rx_packets,
+    )
+    session_success_rate = clamp_rate(established_sessions / expected_sessions)
+
+    tx_bytes = client_tx_bytes + server_tx_bytes
+    rx_bytes = server_rx_bytes + client_rx_bytes
+    tx_packets = client_tx_packets + server_tx_packets
+    rx_packets = server_rx_packets + client_rx_packets
+    checks = {
+        "session_success": session_success_rate >= float(minimum_success_rate),
+        "client_to_server_payload": client_tx_bytes > 0 and server_rx_bytes > 0,
+        "server_to_client_payload": server_tx_bytes > 0 and client_rx_bytes > 0,
+    }
+    result = {
+        "preflight_ok": int(all(checks.values())),
+        "preflight_expected_sessions": expected_sessions,
+        "preflight_established_sessions": established_sessions,
+        "preflight_session_success_rate": session_success_rate,
+        "preflight_packet_loss_rate": (
+            clamp_rate(max(0.0, tx_packets - rx_packets) / tx_packets)
+            if tx_packets > 0
+            else 0.0
+        ),
+        "preflight_throughput_loss_rate": (
+            clamp_rate(max(0.0, tx_bytes - rx_bytes) / tx_bytes)
+            if tx_bytes > 0
+            else 0.0
+        ),
+        "preflight_client_tx_l7_bytes": client_tx_bytes,
+        "preflight_server_rx_l7_bytes": server_rx_bytes,
+        "preflight_server_tx_l7_bytes": server_tx_bytes,
+        "preflight_client_rx_l7_bytes": client_rx_bytes,
+        "preflight_payload_completion_rate": (
+            clamp_rate(
+                min(
+                    client_tx_bytes,
+                    server_rx_bytes,
+                    server_tx_bytes,
+                    client_rx_bytes,
+                )
+                / expected_sessions
+            )
+            if expected_sessions > 0
+            else 0.0
+        ),
+        "preflight_checks": checks,
+    }
+    raw_writer.writerow([
+        ts_iso(),
+        "",
+        "astf_udp_roundtrip_preflight",
+        f"{test_name}_preflight",
+        "summary",
+        json.dumps(result, ensure_ascii=False, default=str),
+    ])
+    if not result["preflight_ok"]:
+        raise RuntimeError(
+            f"ASTF UDP round-trip preflight failed before {test_name}: "
+            f"success={session_success_rate}, checks={checks}"
+        )
+    return result
+
+
+def run_astf_udp_roundtrip_preflight_consecutive(
+    client,
+    target,
+    raw_writer,
+    test_name,
+    recovery_csv,
+    required_successes,
+    interval_sec,
+    timeout_sec,
+    udp_port,
+    cps=DEFAULT_ASTF_PREFLIGHT_CPS,
+    duration_sec=DEFAULT_ASTF_PREFLIGHT_DURATION_SEC,
+    minimum_success_rate=DEFAULT_ASTF_PREFLIGHT_MIN_SUCCESS_RATE,
+    server_ip=None,
+    server_ip_range=None,
+    udp_mtu=1400,
+):
+    """Require consecutive successful UDP ASTF request/reply canaries."""
+
+    def probe(attempt):
+        return run_astf_udp_roundtrip_preflight(
+            client=client,
+            target=target,
+            raw_writer=raw_writer,
+            test_name=f"{test_name}_attempt{attempt}",
+            udp_port=udp_port,
+            cps=cps,
+            duration_sec=duration_sec,
+            minimum_success_rate=minimum_success_rate,
+            server_ip=server_ip,
+            server_ip_range=server_ip_range,
+            udp_mtu=udp_mtu,
+        )
+
+    outcome = run_consecutive_preflight(
+        probe,
+        phase=test_name,
+        csv_path=recovery_csv,
+        required_successes=required_successes,
+        interval_sec=interval_sec,
+        timeout_sec=timeout_sec,
+    )
+    result = dict(outcome.value)
+    result.update({
+        "preflight_attempts": outcome.attempts,
+        "preflight_consecutive_successes": outcome.consecutive_successes,
+        "preflight_recovery_elapsed_sec": outcome.elapsed_sec,
+    })
+    return result
+
 
 def try_arp(client, ports, required=True):
     wait_trex_ports_link_up(client, ports)

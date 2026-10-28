@@ -57,7 +57,7 @@ def build_latency_targets(overrides):
         endpoint_ip = overrides.server_ip or overrides.wan_link_ip
         if endpoint_ip:
             profile["wan_link_ip"] = endpoint_ip
-            profile["server_ip"] = endpoint_ip
+            profile["server_ipv4"] = endpoint_ip
         for argument_name, profile_key in (
             ("wan_gateway_ip", "wan_gateway_ip"),
             ("wan_arp_target", "wan_arp_target"),
@@ -68,7 +68,7 @@ def build_latency_targets(overrides):
                 profile[profile_key] = value
         validate_dslite_profile(name, profile)
         target = build_trex_target(profile)
-        target["wan_ip"] = profile["server_ip"]
+        target["wan_ip"] = profile["server_ipv4"]
         targets[name] = target
     return targets
 

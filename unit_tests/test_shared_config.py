@@ -70,6 +70,7 @@ class SharedConfigTest(unittest.TestCase):
             "dslite_astf",
             "dslite_nat_stability",
             "dslite_tcp_scratch",
+            "mape_tcp_scratch",
             "dslite_source_port_scan",
             "stl",
             "astf",
